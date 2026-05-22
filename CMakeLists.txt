@@ -16,13 +16,20 @@ find_package(Boost REQUIRED)
 find_package(CGAL REQUIRED)
 
 # 4. 包含头文件路径
+include_directories(${CMAKE_SOURCE_DIR})
 include_directories(${Boost_INCLUDE_DIRS})
 include_directories(${CGAL_INCLUDE_DIRS})
 include_directories("${OCC_BASE_DIR}/inc")
 include_directories("E:/soft/CGAL/CGAL-5.6.2/auxiliary/gmp/include")
 
 # 5. 添加可执行程序
-add_executable(CgalApp main.cpp)
+add_executable(CgalApp 
+	main.cpp
+ 	FileName.cpp
+	clipper.engine.cpp
+	clipper.offset.cpp
+	clipper.rectclip.cpp
+)
 
 # 6. 链接库文件 (这里直接给绝对路径，不再依赖脆弱的 find_package)
 target_link_libraries(CgalApp PRIVATE 

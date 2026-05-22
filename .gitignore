@@ -37,3 +37,7 @@ install_manifest.txt
 *~
 .DS_Store
 Thumbs.db
+
+# 输入输出文件
+input/
+output/
