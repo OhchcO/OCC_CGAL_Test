@@ -3,6 +3,7 @@
 #include <vector>
 #include <set>
 #include <map>
+#include <unordered_map>
 #include <cmath>
 
 //CGAL 库用于计算凸包
@@ -24,6 +25,7 @@
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakePolygon.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
+#include <BRepBuilderAPI_Sewing.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #pragma comment(lib, "TKFeat.lib")    // 包含 BRepFeat_SplitShape
 #pragma comment(lib, "TKBool.lib")    // 包含布尔运算
@@ -947,19 +949,51 @@ bool IsPointEqual(const Point3D& p1, const Point3D& p2, double tol = 1e-3) {
 // 从所有分层切片中提取出 CAVITY 面的 faceId 集合
 std::set<int> CollectCavityFaceIds(const std::vector<std::vector<Face2D>>& allLayerFaces) {
     std::set<int> cavityFaceIds;
-    for (const auto& layerFaces : allLayerFaces) {
+
+    // 遍历每一层
+    for (int layerIdx = 0; layerIdx < allLayerFaces.size(); ++layerIdx)
+    {
+        const auto& layerFaces = allLayerFaces[layerIdx];
+        std::set<int> currentLayerFaceIds; // 只存当前层的faceId
+
+        // 遍历当前层所有面
         for (const auto& face : layerFaces) {
-            if (face.type != FaceType::CAVITY) continue;
+            if (face.type != FaceType::CAVITY)
+                continue;
+
+            // 外环线
             for (const auto& line : face.outerLoop) {
-                if (line.faceId >= 0) cavityFaceIds.insert(line.faceId);
+                if (line.faceId >= 0) {
+                    currentLayerFaceIds.insert(line.faceId);
+                    cavityFaceIds.insert(line.faceId);
+                }
             }
+            // 内环线
             for (const auto& innerLoop : face.innerLoops) {
                 for (const auto& line : innerLoop) {
-                    if (line.faceId >= 0) cavityFaceIds.insert(line.faceId);
+                    if (line.faceId >= 0) {
+                        currentLayerFaceIds.insert(line.faceId);
+                        cavityFaceIds.insert(line.faceId);
+                    }
                 }
             }
         }
+
+        // 输出：当前层得到了哪些 faceId
+        std::cout << "Layer " << layerIdx << " faces: ";
+        for (int id : currentLayerFaceIds) {
+            std::cout << id << " ";
+        }
+        std::cout << std::endl;
     }
+
+    // 最终总结果
+    std::cout << "All cavity face IDs: ";
+    for (int id : cavityFaceIds) {
+        std::cout << id << " ";
+    }
+    std::cout << std::endl;
+
     return cavityFaceIds;
 }
 
@@ -1127,66 +1161,91 @@ vector<OneLine> DeduplicateLines(const vector<OneLine>& lines) {
 vector<Loop> BuildLoops(const vector<OneLine>& inputLines) {
     vector<Loop> loops;
     auto lines = DeduplicateLines(inputLines);
+    if (lines.empty()) return loops;
+
     vector<bool> visited(lines.size(), false);
-    const double adjTol = 1e-4;
-    const double closeTol = 0.1;
+    const double snapTol = 1e-3;
+
+    auto Snap = [](const Point3D& p, double tol) -> std::pair<int64_t, int64_t> {
+        return { (int64_t)round(p.x / tol), (int64_t)round(p.y / tol) };
+    };
+
+    std::unordered_map<int64_t, std::vector<size_t>> endMap;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        auto sk = Snap(lines[i].start, snapTol);
+        auto ek = Snap(lines[i].end, snapTol);
+        int64_t startKey = sk.first * 1000000007LL + sk.second;
+        int64_t endKey = ek.first * 1000000007LL + ek.second;
+        endMap[startKey].push_back(i);
+        if (startKey != endKey) {
+            endMap[endKey].push_back(i);
+        }
+    }
 
     for (size_t i = 0; i < lines.size(); ++i) {
         if (visited[i]) continue;
 
         Loop currentLoop;
-        vector<size_t> pending;
         currentLoop.push_back(lines[i]);
-        pending.push_back(i);
-        Point3D start = currentLoop.front().start;
-        Point3D currEnd = currentLoop.back().end;
+        visited[i] = true;
+        Point3D startPt = lines[i].start;
+        Point3D currEnd = lines[i].end;
 
         while (true) {
-            bool found = false;
-            for (size_t j = 0; j < lines.size(); ++j) {
-                if (visited[j]) continue;
-                bool inLoop = false;
-                for (auto idx : pending) {
-                    if (idx == j) { inLoop = true; break; }
-                }
-                if (inLoop) continue;
+            auto key = Snap(currEnd, snapTol);
+            int64_t mapKey = key.first * 1000000007LL + key.second;
 
-                const auto& l = lines[j];
+            size_t bestIdx = SIZE_MAX;
+            double bestDist = 1e9;
+            bool bestReverse = false;
 
-                if (IsPointEqual(currEnd, l.start, adjTol)) {
-                    currentLoop.push_back(l);
-                    currEnd = l.end;
-                    pending.push_back(j);
-                    found = true;
-                    break;
-                }
-                if (IsPointEqual(currEnd, l.end, adjTol)) {
-                    OneLine rev = l;
-                    swap(rev.start, rev.end);
-                    currentLoop.push_back(rev);
-                    currEnd = rev.end;
-                    pending.push_back(j);
-                    found = true;
-                    break;
+            auto it = endMap.find(mapKey);
+            if (it != endMap.end()) {
+                for (size_t idx : it->second) {
+                    if (visited[idx]) continue;
+                    const auto& l = lines[idx];
+                    double dS = fabs(currEnd.x - l.start.x) + fabs(currEnd.y - l.start.y);
+                    double dE = fabs(currEnd.x - l.end.x) + fabs(currEnd.y - l.end.y);
+                    if (dS < snapTol && dS < bestDist) {
+                        bestDist = dS; bestIdx = idx; bestReverse = false;
+                    }
+                    if (dE < snapTol && dE < bestDist) {
+                        bestDist = dE; bestIdx = idx; bestReverse = true;
+                    }
                 }
             }
-            if (!found) break;
-            if (IsPointEqual(currEnd, start, closeTol)) break;
+
+            if (bestIdx == SIZE_MAX) break;
+
+            visited[bestIdx] = true;
+            if (bestReverse) {
+                OneLine rev = lines[bestIdx];
+                swap(rev.start, rev.end);
+                currentLoop.push_back(rev);
+                currEnd = rev.end;
+            } else {
+                currentLoop.push_back(lines[bestIdx]);
+                currEnd = lines[bestIdx].end;
+            }
+
+            if (IsPointEqual(currEnd, startPt, snapTol)) break;
         }
 
-        if (IsPointEqual(currentLoop.back().end, currentLoop.front().start, closeTol)
+        if (IsPointEqual(currentLoop.back().end, currentLoop.front().start, snapTol)
             && currentLoop.size() >= 3)
         {
-            for (auto idx : pending) visited[idx] = true;
             loops.push_back(currentLoop);
         }
     }
 
     cout << "\n================ 最终结果 =================" << endl;
-    cout << " 成功生成环数量：" << loops.size()  << endl;
-    for (int i = 0; i < loops.size(); i++) {
+    cout << " 成功生成环数量：" << loops.size() << endl;
+    for (size_t i = 0; i < loops.size(); i++) {
         cout << "  环 " << i + 1 << "：" << loops[i].size() << " 条线段" << endl;
     }
+    int usedCount = 0;
+    for (bool v : visited) if (v) usedCount++;
+    cout << "  输入线段: " << lines.size() << " 已用: " << usedCount << " 未用: " << lines.size() - usedCount << endl;
     cout << "==========================================\n" << endl;
 
     return loops;
@@ -1515,7 +1574,18 @@ std::vector<Face2D> SliceModelAtZ(const TopoDS_Shape& shape, double splitZ, int 
                 for (; edgeExp.More(); edgeExp.Next()) {
                     TopoDS_Edge E = TopoDS::Edge(edgeExp.Current());
                     builder.Add(intersectionLinesCompound, E);
-                    edgeToFaceMap.Bind(E, face); // 记录交线来源的面
+                    if (edgeToFaceMap.IsBound(E)) {
+                        // 两条边重叠：选择更低的面（更贴近 splitZ 的面）
+                        TopoDS_Face existingFace = TopoDS::Face(edgeToFaceMap.Find(E));
+                        double eZmin, eZmax, fZmin, fZmax;
+                        GetFaceZRange(existingFace, eZmin, eZmax);
+                        GetFaceZRange(face, fZmin, fZmax);
+                        if (fZmax < eZmax) {
+                            edgeToFaceMap.Bind(E, face); // 新面更低，替换
+                        }
+                    } else {
+                        edgeToFaceMap.Bind(E, face);
+                    }
                     lineCount++;
                 }
             }
@@ -2934,8 +3004,38 @@ void ExportOpenCavityFaces(const TopoDS_Shape& solid,
 TopoDS_Compound GetOpenCavityCompound(const TopoDS_Shape& solid,
     const std::set<int>& openFaceIds,
     const TopTools_DataMapOfShapeInteger& faceToIdMap) {
+    std::cout << "\n===== [DEBUG] GetOpenCavityCompound 开始 =====" << std::endl;
+    std::cout << "  输入 openFaceIds 共 " << openFaceIds.size() << " 个: ";
+    for (int fid : openFaceIds) std::cout << fid << " ";
+    std::cout << std::endl;
+
     TopoDS_Compound wallFaces = GetFacesByFaceIds(solid, openFaceIds, faceToIdMap);
+
+    int wallCount = 0;
+    TopExp_Explorer wallDebug(wallFaces, TopAbs_FACE);
+    for (; wallDebug.More(); wallDebug.Next()) {
+        TopoDS_Face f = TopoDS::Face(wallDebug.Current());
+        double zmin, zmax;
+        GetFaceZRange(f, zmin, zmax);
+        int fid = faceToIdMap.IsBound(f) ? faceToIdMap.Find(f) : -1;
+        std::cout << "  [侧壁面] faceId=" << fid << "  Zrange=[" << zmin << ", " << zmax << "]" << std::endl;
+        wallCount++;
+    }
+    std::cout << "  侧壁面总数: " << wallCount << std::endl;
+
     TopoDS_Compound capFaces = GetOpenCavityCapFaces(solid, openFaceIds, faceToIdMap);
+
+    int capCount = 0;
+    TopExp_Explorer capDebug(capFaces, TopAbs_FACE);
+    for (; capDebug.More(); capDebug.Next()) {
+        TopoDS_Face f = TopoDS::Face(capDebug.Current());
+        double zmin, zmax;
+        GetFaceZRange(f, zmin, zmax);
+        int fid = faceToIdMap.IsBound(f) ? faceToIdMap.Find(f) : -1;
+        std::cout << "  [盖板面] faceId=" << fid << "  Zrange=[" << zmin << ", " << zmax << "]" << std::endl;
+        capCount++;
+    }
+    std::cout << "  盖板面总数: " << capCount << std::endl;
 
     BRep_Builder builder;
     TopoDS_Compound result;
@@ -2946,6 +3046,8 @@ TopoDS_Compound GetOpenCavityCompound(const TopoDS_Shape& solid,
     TopExp_Explorer expCap(capFaces, TopAbs_FACE);
     for (; expCap.More(); expCap.Next()) builder.Add(result, expCap.Current());
 
+    std::cout << "  最终 Compound 总面数: " << wallCount + capCount << std::endl;
+    std::cout << "===== [DEBUG] GetOpenCavityCompound 结束 =====\n" << std::endl;
     return result;
 }
 
@@ -2958,9 +3060,17 @@ std::vector<CavityFeature> GenerateOpenCavityFeatures(
     const std::vector<double>& sortedSplitPoints,
     const TopTools_DataMapOfShapeInteger& faceToIdMap)
 {
+    std::cout << "\n===== [DEBUG] GenerateOpenCavityFeatures 开始 =====" << std::endl;
+    std::cout << "  isolatedCavities 数量: " << isolatedCavities.size() << std::endl;
+    std::cout << "  allLayerFaces 层数: " << allLayerFaces.size() << std::endl;
+    std::cout << "  sortedSplitPoints (" << sortedSplitPoints.size() << "个): ";
+    for (size_t s = 0; s < sortedSplitPoints.size(); ++s) std::cout << sortedSplitPoints[s] << " ";
+    std::cout << std::endl;
+
     std::vector<CavityFeature> finalFeatures;
 
     for (size_t i = 0; i < isolatedCavities.size(); ++i) {
+        std::cout << "\n  --- [DEBUG] 处理 isolatedCavity [" << i << "] ---" << std::endl;
         CavityFeature feat;
         feat.featureId = (int)i;
         feat.topZ = -1e9;
@@ -2968,21 +3078,38 @@ std::vector<CavityFeature> GenerateOpenCavityFeatures(
         double lastLoopZ = 1e9;
 
         TopExp_Explorer exp(isolatedCavities[i], TopAbs_FACE);
+        int faceCountInCompound = 0;
         for (; exp.More(); exp.Next()) {
             if (faceToIdMap.IsBound(exp.Current())) {
                 feat.sourceFaceIds.insert(faceToIdMap.Find(exp.Current()));
             }
+            faceCountInCompound++;
         }
+        std::cout << "  Compound 内总面数: " << faceCountInCompound << std::endl;
+        std::cout << "  sourceFaceIds (" << feat.sourceFaceIds.size() << "个): ";
+        for (int fid : feat.sourceFaceIds) std::cout << fid << " ";
+        std::cout << std::endl;
 
         Bnd_Box box;
         BRepBndLib::Add(isolatedCavities[i], box);
         double x1, y1, zmin_box, x2, y2, zmax_box;
         box.Get(x1, y1, zmin_box, x2, y2, zmax_box);
+        std::cout << "  3D包围盒: X=[" << x1 << ", " << x2 << "] Y=[" << y1 << ", " << y2 << "] Z=[" << zmin_box << ", " << zmax_box << "]" << std::endl;
+
+        int layerIdx = 0;
+        int skippedNonOpen = 0;
+        int skippedIdMismatch = 0;
+        int skippedBBoxMismatch = 0;
+        int matchedLoops = 0;
 
         for (const auto& layer : allLayerFaces) {
+            int faceIdxInLayer = 0;
             for (const auto& f2d : layer) {
-                // 🔓 核心突破口：此处严格阻断 CAVITY，只放行精密圆角提纯后的 OPENCAVITY 类型切片！
-                if (f2d.type != FaceType::OPENCAVITY || f2d.outerLoop.empty()) continue;
+                if (f2d.type != FaceType::OPENCAVITY || f2d.outerLoop.empty()) {
+                    skippedNonOpen++;
+                    faceIdxInLayer++;
+                    continue;
+                }
 
                 // 投票法统计外环所有线段的 faceId，取出现频率最高的
                 std::map<int, int> idVoteCount;
@@ -3000,37 +3127,83 @@ std::vector<CavityFeature> GenerateOpenCavityFeatures(
                     }
                 }
 
-                if (dominantFaceId >= 0 && feat.sourceFaceIds.count(dominantFaceId)) {
-                    Point3D p = f2d.outerLoop[0].start;
-                    if (p.x >= x1 - 0.5 && p.x <= x2 + 0.5 && p.y >= y1 - 0.5 && p.y <= y2 + 0.5) {
-                        double curZ = p.z;
-
-                        CavityLoop out;
-                        out.lines = f2d.outerLoop; out.zHeight = curZ; out.isOuter = true;
-                        feat.stepLoops.push_back(out);
-
-                        for (const auto& inner : f2d.innerLoops) {
-                            CavityLoop in;
-                            in.lines = inner; in.zHeight = curZ; in.isOuter = false;
-                            feat.stepLoops.push_back(in);
-                        }
-
-                        feat.topZ = std::max(feat.topZ, curZ);
-                        lastLoopZ = std::min(lastLoopZ, curZ);
+                // ID 匹配检查
+                if (dominantFaceId < 0 || !feat.sourceFaceIds.count(dominantFaceId)) {
+                    if (dominantFaceId >= 0) {
+                        std::cout << "    [层" << layerIdx << " 面" << faceIdxInLayer << "] OPENCAVITY dominantFaceId=" << dominantFaceId
+                                  << " (投票=" << maxVotes << ") 不在 sourceFaceIds 中 → 跳过" << std::endl;
                     }
+                    skippedIdMismatch++;
+                    faceIdxInLayer++;
+                    continue;
                 }
+
+                Point3D p = f2d.outerLoop[0].start;
+                bool inBBox = (p.x >= x1 - 0.5 && p.x <= x2 + 0.5 && p.y >= y1 - 0.5 && p.y <= y2 + 0.5);
+                if (!inBBox) {
+                    std::cout << "    [层" << layerIdx << " 面" << faceIdxInLayer << "] OPENCAVITY dominantFaceId=" << dominantFaceId
+                              << " ID匹配OK 但 XY不在包围盒内! 首点=(" << p.x << ", " << p.y << ", " << p.z << ") → 跳过" << std::endl;
+                    skippedBBoxMismatch++;
+                    faceIdxInLayer++;
+                    continue;
+                }
+
+                double curZ = p.z;
+                int innerCount = (int)f2d.innerLoops.size();
+
+                CavityLoop out;
+                out.lines = f2d.outerLoop; out.zHeight = curZ; out.isOuter = true;
+                feat.stepLoops.push_back(out);
+
+                for (const auto& inner : f2d.innerLoops) {
+                    CavityLoop in;
+                    in.lines = inner; in.zHeight = curZ; in.isOuter = false;
+                    feat.stepLoops.push_back(in);
+                }
+
+                feat.topZ = std::max(feat.topZ, curZ);
+                lastLoopZ = std::min(lastLoopZ, curZ);
+                matchedLoops++;
+
+                std::cout << "    [层" << layerIdx << " 面" << faceIdxInLayer << "] ✅ 匹配! dominantFaceId=" << dominantFaceId
+                          << " curZ=" << curZ << " innerLoops=" << innerCount
+                          << " outerLoop段数=" << f2d.outerLoop.size() << std::endl;
+
+                faceIdxInLayer++;
             }
+            layerIdx++;
         }
+
+        std::cout << "  [DEBUG] 匹配统计: matchedLoops=" << matchedLoops
+                  << " skippedNonOpen=" << skippedNonOpen
+                  << " skippedIdMismatch=" << skippedIdMismatch
+                  << " skippedBBoxMismatch=" << skippedBBoxMismatch << std::endl;
+        std::cout << "  [DEBUG] 最终 stepLoops 数: " << feat.stepLoops.size()
+                  << " topZ=" << feat.topZ << " lastLoopZ(最低环)=" << lastLoopZ << std::endl;
 
         if (!feat.stepLoops.empty()) {
             feat.bottomZ = lastLoopZ;
+            bool foundSplitPoint = false;
             for (size_t k = 0; k < sortedSplitPoints.size(); ++k) {
                 if (std::abs(sortedSplitPoints[k] - lastLoopZ) < 1e-4) {
+                    foundSplitPoint = true;
                     if (k + 1 < sortedSplitPoints.size()) {
+                        std::cout << "  [DEBUG] bottomZ修正: lastLoopZ=" << lastLoopZ
+                                  << " 匹配到 splitPoints[" << k << "]=" << sortedSplitPoints[k]
+                                  << " → 取下一个 splitPoints[" << k + 1 << "]=" << sortedSplitPoints[k + 1]
+                                  << " 作为 bottomZ" << std::endl;
                         feat.bottomZ = sortedSplitPoints[k + 1];
+                    } else {
+                        std::cout << "  [DEBUG] bottomZ修正: lastLoopZ=" << lastLoopZ
+                                  << " 匹配到 splitPoints[" << k << "]=" << sortedSplitPoints[k]
+                                  << " 但已是最后一个点，无法再向下取 → bottomZ保持lastLoopZ=" << lastLoopZ << std::endl;
                     }
                     break;
                 }
+            }
+            if (!foundSplitPoint) {
+                std::cout << "  [DEBUG] ⚠️ bottomZ修正: lastLoopZ=" << lastLoopZ
+                          << " 在 sortedSplitPoints 中没有找到匹配项(容差1e-4)! bottomZ保持lastLoopZ=" << lastLoopZ << std::endl;
             }
             feat.totalDepth = std::abs(feat.topZ - feat.bottomZ);
             std::sort(feat.stepLoops.begin(), feat.stepLoops.end(),
@@ -3039,45 +3212,94 @@ std::vector<CavityFeature> GenerateOpenCavityFeatures(
         }
     }
 
-    // ==================== 详细信息打印开始（开放特征工艺定制版） ====================
-
+    std::cout << "\n===== [DEBUG] GenerateOpenCavityFeatures 结果汇总 =====" << std::endl;
     for (const auto& feat : finalFeatures) {
         cout << ">>> [开放型腔 ID: " << feat.featureId << "]" << endl;
         cout << "    - 空间范围: Z_Top = " << feat.topZ << " / Z_Floor = " << feat.bottomZ << endl;
         cout << "    - 开粗深度: " << feat.totalDepth << " mm" << endl;
         cout << "    - 进刀方案: 外部侧向安全切入 (Side Entry)" << endl;
 
-
-        // 打印原始面 ID 清单
         cout << "    - 关联原始面 ID (" << feat.sourceFaceIds.size() << "个): ";
         for (int oid : feat.sourceFaceIds) cout << oid << " ";
         cout << endl;
 
+        cout << "    - stepLoops 详情 (" << feat.stepLoops.size() << "个):" << endl;
+        for (size_t sl = 0; sl < feat.stepLoops.size(); ++sl) {
+            const auto& loop = feat.stepLoops[sl];
+            cout << "      [" << sl << "] isOuter=" << (loop.isOuter ? "外环" : "内环")
+                 << " zHeight=" << loop.zHeight
+                 << " 线段数=" << loop.lines.size();
+            if (!loop.lines.empty()) {
+                Point3D s = loop.lines.front().start;
+                Point3D e = loop.lines.back().end;
+                cout << " 首点=(" << s.x << "," << s.y << "," << s.z << ")"
+                     << " 末点=(" << e.x << "," << e.y << "," << e.z << ")";
+            }
+            cout << endl;
+        }
     }
+    std::cout << "===== [DEBUG] GenerateOpenCavityFeatures 结束 =====\n" << std::endl;
 
     return finalFeatures;
 }
 
+
+#include <GProp_GProps.hxx>
+#include <BRepGProp.hxx>
 
 TopoDS_Compound ExtractTrueOpenCavityFaces(
     const CavityFeature& openFeat,
     const TopoDS_Shape& mainShape,
     const TopTools_DataMapOfShapeInteger& faceToIdMap,
     const std::vector<std::vector<Face2D>>& allClosedLayerFaces,
-    const std::vector<double>& splitPoints)
+    const std::vector<double>& splitPoints,
+    const std::vector<TopoDS_Compound>& trueClosedCavities)
 {
     BRep_Builder builder;
     TopoDS_Compound refinedResult;
     builder.MakeCompound(refinedResult);
 
     // =========================================================================
-    // 📡 1. 雷达侦测：定位分水岭高度 cutZ 并且新增捕获封闭腔底部高度 closedBottomZ
-    //    关键改进：同时收集嵌套封闭型腔的全部面 ID，用于后续精确剔除
+    // 🧬 1. 建立确凿证据库：提取所有已知封闭型腔面的几何指纹（面积和重心）
+    // =========================================================================
+    struct FaceSignature {
+        double area;
+        gp_Pnt centroid;
+    };
+    std::vector<FaceSignature> closedSignatures;
+
+    for (const auto& closedComp : trueClosedCavities) {
+        TopExp_Explorer fExp(closedComp, TopAbs_FACE);
+        for (; fExp.More(); fExp.Next()) {
+            TopoDS_Face f = TopoDS::Face(fExp.Current());
+            GProp_GProps props;
+            BRepGProp::SurfaceProperties(f, props);
+            if (props.Mass() > 1e-6) {
+                closedSignatures.push_back({ props.Mass(), props.CentreOfMass() });
+            }
+        }
+    }
+
+    auto IsClosedCavityFace = [&](const TopoDS_Face& face) -> bool {
+        GProp_GProps props;
+        BRepGProp::SurfaceProperties(face, props);
+        double area = props.Mass();
+        if (area <= 1e-6) return false;
+        gp_Pnt center = props.CentreOfMass();
+
+        for (const auto& sig : closedSignatures) {
+            // 容差设定：面积误差 < 1e-3，重心偏移 < 1e-3
+            if (std::abs(sig.area - area) < 1e-3 && sig.centroid.Distance(center) < 1e-3) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // =========================================================================
+    // 📡 2. 雷达侦测：定位分水岭高度 cutZ（只为了切开跨越的侧壁）
     // =========================================================================
     double cutZ = openFeat.topZ;
-    double closedBottomZ = -1e9;
-    bool hasNestedClosedCavity = false;
-
     TopoDS_Wire closedTopWire;
     std::set<int> closedFaceIds = CollectCavityFaceIds(allClosedLayerFaces);
 
@@ -3105,8 +3327,6 @@ TopoDS_Compound ExtractTrueOpenCavityFaces(
                 closedFeat.topZ <= openFeat.topZ + 0.1 && closedFeat.topZ >= openFeat.bottomZ - 0.1)
             {
                 cutZ = closedFeat.topZ;
-                closedBottomZ = closedFeat.bottomZ;
-                hasNestedClosedCavity = true;
 
                 const auto& tLoop = closedFeat.stepLoops.front();
                 BRepBuilderAPI_MakePolygon poly;
@@ -3116,46 +3336,17 @@ TopoDS_Compound ExtractTrueOpenCavityFaces(
                 }
                 if (poly.IsDone()) closedTopWire = poly.Wire();
 
-                std::cout << "    [智能联动] 锁定内部嵌套封闭孔: 顶切分点 Z = " << cutZ
-                    << ", 底截断点 Z = " << closedBottomZ << std::endl;
+                std::cout << "    [智能联动] 锁定内部嵌套封闭孔: 顶切分点 Z = " << cutZ << std::endl;
                 break;
             }
         }
     }
 
     // =========================================================================
-    // ⚔️ 2. 以封闭型腔顶环为基准，切分并过滤
-    //    核心逻辑：在环处切分侧面 → 最高点在环下方 且 距离环为0 → 封闭型腔面 → 剔除
+    // ⚔️ 3. 物理切割并使用指纹库比对剔除
     // =========================================================================
     gp_Pln cuttingPlane(gp_Pnt(0, 0, cutZ), gp_Dir(0, 0, 1));
     TopoDS_Face splitPlaneFace = BRepBuilderAPI_MakeFace(cuttingPlane);
-
-    auto IsClosedCavityFace = [&](const TopoDS_Face& face) -> bool {
-        double zmin, zmax;
-        GetFaceZRange(face, zmin, zmax);
-
-        if (zmax > cutZ + 1e-4) return false;
-
-        if (!closedTopWire.IsNull()) {
-            BRepExtrema_DistShapeShape distCalc(face, closedTopWire);
-            if (distCalc.IsDone() && distCalc.Value() < 1e-3) {
-                return true;
-            }
-        }
-
-        if (hasNestedClosedCavity && std::abs(zmax - closedBottomZ) < 1e-2 && std::abs(zmin - closedBottomZ) < 1e-2) {
-            BRepAdaptor_Surface surf(face);
-            if (surf.GetType() == GeomAbs_Plane) {
-                gp_Dir normal = surf.Plane().Axis().Direction();
-                if (face.Orientation() == TopAbs_REVERSED) normal.Reverse();
-                if (normal.IsParallel(gp_Dir(0, 0, 1), 0.01)) {
-                    return true;
-                }
-            }
-        }
-
-        return false;
-    };
 
     TopExp_Explorer exp(mainShape, TopAbs_FACE);
     for (; exp.More(); exp.Next()) {
@@ -3167,11 +3358,15 @@ TopoDS_Compound ExtractTrueOpenCavityFaces(
         double zmin, zmax;
         GetFaceZRange(originalFace, zmin, zmax);
 
+        // 如果面完全在 cutZ 上方
         if (zmin >= cutZ - 1e-4) {
-            builder.Add(refinedResult, originalFace);
+            if (!IsClosedCavityFace(originalFace)) {
+                builder.Add(refinedResult, originalFace);
+            }
             continue;
         }
 
+        // 如果面完全在 cutZ 下方（例如底面，如面 23）
         if (zmax <= cutZ + 1e-4) {
             if (!IsClosedCavityFace(originalFace)) {
                 builder.Add(refinedResult, originalFace);
@@ -3179,6 +3374,7 @@ TopoDS_Compound ExtractTrueOpenCavityFaces(
             continue;
         }
 
+        // 跨越 cutZ 的面，执行切割
         if (zmax > cutZ + 1e-4 && zmin < cutZ - 1e-4) {
             BRepAlgoAPI_Section section(originalFace, splitPlaneFace);
             section.Build();
@@ -3192,14 +3388,8 @@ TopoDS_Compound ExtractTrueOpenCavityFaces(
                     TopExp_Explorer subExp(splitter.Shape(), TopAbs_FACE);
                     for (; subExp.More(); subExp.Next()) {
                         TopoDS_Face subF = TopoDS::Face(subExp.Current());
-                        double sMin, sMax;
-                        GetFaceZRange(subF, sMin, sMax);
-                        if (sMin >= cutZ - 1e-4) {
+                        if (!IsClosedCavityFace(subF)) {
                             builder.Add(refinedResult, subF);
-                        } else {
-                            if (!IsClosedCavityFace(subF)) {
-                                builder.Add(refinedResult, subF);
-                            }
                         }
                     }
                 }
@@ -3422,7 +3612,166 @@ std::vector<CavityFeature> ConvertPartsToFeatures(
     return subFeatures;
 }
 
-#include <BRepBuilderAPI_Sewing.hxx>
+
+
+std::pair<TopoDS_Compound, TopoDS_Compound> SplitCompoundAtZ(
+    const TopoDS_Compound& cavity, double splitZ) {
+
+    BRep_Builder builder;
+    TopoDS_Compound upper, lower;
+    builder.MakeCompound(upper);
+    builder.MakeCompound(lower);
+
+    TopTools_DataMapOfIntegerShape idToFace;
+    std::set<int> aboveIds, belowIds, facesToSplit;
+    int nextId = 1;
+
+    TopExp_Explorer exp(cavity, TopAbs_FACE);
+    for (; exp.More(); exp.Next()) {
+        TopoDS_Face f = TopoDS::Face(exp.Current());
+        int id = nextId++;
+        idToFace.Bind(id, f);
+
+        if (IsHorizontalFace(f)) {
+            double z = GetHorizontalFaceZ(f);
+            if (std::abs(z - splitZ) <= 1e-4) {
+                gp_Dir normal = GetFaceNormal(f);
+                if (normal.Z() < -0.5) belowIds.insert(id);
+                else aboveIds.insert(id);
+            } else if (z > splitZ) {
+                aboveIds.insert(id);
+            } else {
+                belowIds.insert(id);
+            }
+        } else {
+            double zmin, zmax;
+            GetFaceZRange(f, zmin, zmax);
+            if (zmin >= splitZ - 1e-4) {
+                aboveIds.insert(id);
+            } else if (zmax <= splitZ + 1e-4) {
+                belowIds.insert(id);
+            } else {
+                facesToSplit.insert(id);
+            }
+        }
+    }
+
+    gp_Pln cuttingPlane(gp_Pnt(0, 0, splitZ), gp_Dir(0, 0, 1));
+    TopoDS_Face planeFace = BRepBuilderAPI_MakeFace(cuttingPlane);
+
+    for (int id : facesToSplit) {
+        TopoDS_Face faceToCut = TopoDS::Face(idToFace.Find(id));
+
+        BRepAlgoAPI_Section section(faceToCut, planeFace);
+        section.Build();
+
+        if (!section.IsDone() || !TopExp_Explorer(section.Shape(), TopAbs_EDGE).More()) {
+            belowIds.insert(id);
+            continue;
+        }
+
+        BRepFeat_SplitShape splitter(faceToCut);
+        TopExp_Explorer edgeExp(section.Shape(), TopAbs_EDGE);
+        for (; edgeExp.More(); edgeExp.Next()) {
+            splitter.Add(TopoDS::Edge(edgeExp.Current()), faceToCut);
+        }
+        splitter.Build();
+
+        if (splitter.IsDone()) {
+            TopExp_Explorer faceExp(splitter.Shape(), TopAbs_FACE);
+            for (; faceExp.More(); faceExp.Next()) {
+                TopoDS_Face subFace = TopoDS::Face(faceExp.Current());
+                double smin, smax;
+                GetFaceZRange(subFace, smin, smax);
+                double zMid = (smin + smax) / 2.0;
+
+                int newId = nextId++;
+                idToFace.Bind(newId, subFace);
+
+                if (zMid > splitZ) aboveIds.insert(newId);
+                else belowIds.insert(newId);
+            }
+        } else {
+            belowIds.insert(id);
+        }
+    }
+
+    for (int id : aboveIds) {
+        if (idToFace.IsBound(id)) builder.Add(upper, idToFace.Find(id));
+    }
+    for (int id : belowIds) {
+        if (idToFace.IsBound(id)) builder.Add(lower, idToFace.Find(id));
+    }
+
+    return { upper, lower };
+}
+
+std::vector<TopoDS_Compound> RecursiveSplitOpenCavity(const TopoDS_Compound& cavity) {
+    std::vector<TopoDS_Compound> result;
+
+    TopTools_IndexedDataMapOfShapeListOfShape edgeToFaces;
+    TopExp::MapShapesAndAncestors(cavity, TopAbs_EDGE, TopAbs_FACE, edgeToFaces);
+
+    std::set<double> zSet;
+    TopExp_Explorer exp(cavity, TopAbs_FACE);
+    for (; exp.More(); exp.Next()) {
+        TopoDS_Face f = TopoDS::Face(exp.Current());
+        if (!IsHorizontalFace(f)) continue;
+
+        double zFace = GetHorizontalFaceZ(f);
+        bool isIntermediateStep = false;
+
+        TopExp_Explorer edgeExp(f, TopAbs_EDGE);
+        for (; edgeExp.More(); edgeExp.Next()) {
+            const TopoDS_Edge& edge = TopoDS::Edge(edgeExp.Current());
+            if (!edgeToFaces.Contains(edge)) continue;
+
+            const TopTools_ListOfShape& neighbors = edgeToFaces.FindFromKey(edge);
+            TopTools_ListIteratorOfListOfShape it(neighbors);
+            for (; it.More(); it.Next()) {
+                TopoDS_Face nFace = TopoDS::Face(it.Value());
+                if (nFace.IsSame(f)) continue;
+
+                double nZmin, nZmax;
+                GetFaceZRange(nFace, nZmin, nZmax);
+                if (nZmin < zFace - 1e-3) {
+                    isIntermediateStep = true;
+                    break;
+                }
+            }
+            if (isIntermediateStep) break;
+        }
+
+        if (isIntermediateStep) zSet.insert(zFace);
+    }
+
+    if (zSet.empty()) {
+        result.push_back(cavity);
+        return result;
+    }
+
+    double splitZ = *zSet.rbegin();
+    std::cout << "  [递推切割] Z = " << splitZ << std::endl;
+
+    auto [upper, lower] = SplitCompoundAtZ(cavity, splitZ);
+    result.push_back(upper);
+
+    std::vector<TopoDS_Compound> lowerParts = SeparateDisconnectedCavities(lower);
+    std::cout << "  [连通性] 下方拆分为 " << lowerParts.size() << " 个独立部分" << std::endl;
+
+    if (lowerParts.size() > 1) {
+        for (const auto& part : lowerParts) {
+            auto subResult = RecursiveSplitOpenCavity(part);
+            result.insert(result.end(), subResult.begin(), subResult.end());
+        }
+    } else {
+        auto subResult = RecursiveSplitOpenCavity(lower);
+        result.insert(result.end(), subResult.begin(), subResult.end());
+    }
+
+    return result;
+}
+
 /**
  * @brief 【开放型腔专属】全量特征提取与物理分割大管家
  * @param allOpenLayerFaces 开放型腔专用的切片数据容器
@@ -3435,6 +3784,7 @@ std::vector<CavityFeature> ConvertPartsToFeatures(
 void ProcessAndSplitOpenCavityFeatures(
     const std::vector<std::vector<Face2D>>& allOpenLayerFaces,
     const std::vector<std::vector<Face2D>>& allClosedLayerFaces,
+    const std::vector<TopoDS_Compound>& trueClosedCavities,
     const TopoDS_Shape& mainShape,
     const std::vector<double>& splitPoints,
     const TopTools_DataMapOfShapeInteger& faceToIdMap,
@@ -3464,7 +3814,7 @@ void ProcessAndSplitOpenCavityFeatures(
     vector<TopoDS_Compound> trueOpenCavities;
 
     for (const auto& feat : cavityFeatures) {
-        TopoDS_Compound trueCavity = ExtractTrueOpenCavityFaces(feat, mainShape, faceToIdMap, allClosedLayerFaces, splitPoints);
+        TopoDS_Compound trueCavity = ExtractTrueOpenCavityFaces(feat, mainShape, faceToIdMap, allClosedLayerFaces, splitPoints, trueClosedCavities);
 		trueOpenCavities.push_back(trueCavity);
         std::string filePath = savePath + "Final_True_OpenCavity_" + std::to_string(feat.featureId) + ".brep";
         BRepTools::Write(trueCavity, filePath.c_str());
@@ -3476,8 +3826,8 @@ void ProcessAndSplitOpenCavityFeatures(
 
     for (size_t i = 0; i < trueOpenCavities.size(); ++i) {
 
-        // 获取当前父型腔沿 Z 轴切分后的所有层
-        std::vector<TopoDS_Compound> zLayers = SplitCavity(trueOpenCavities[i]);
+        // 获取当前父型腔沿 Z 轴递推切分后的所有层
+        std::vector<TopoDS_Compound> zLayers = RecursiveSplitOpenCavity(trueOpenCavities[i]);
 
         for (size_t j = 0; j < zLayers.size(); ++j) {
 
@@ -3494,6 +3844,9 @@ void ProcessAndSplitOpenCavityFeatures(
             for (; faceExp.More(); faceExp.Next()) {
                 compBuilder.Add(sewedCompound, faceExp.Current());
             }
+            std::string fileName = savePath + "temp_sew" + std::to_string(totalPartCount) + ".brep";
+            BRepTools::Write(sewedCompound, fileName.c_str());
+
 
             // 🎯 【连通性检测与孤岛修复】
             std::vector<TopoDS_Compound> rawSubParts = SeparateDisconnectedCavities(sewedCompound);
@@ -3535,17 +3888,19 @@ void ProcessAndSplitOpenCavityFeatures(
  * @param faceToIdMap 原始模型的面到唯一 ID 的绑定映射表
  * @param savePath 文件输出的绝对路径
  */
-void ProcessAndSplitClosedCavityFeatures(
+std::vector<TopoDS_Compound> ProcessAndSplitClosedCavityFeatures(
     const std::vector<std::vector<Face2D>>& allLayerFaces,
     const TopoDS_Shape& mainShape,
     const std::vector<double>& splitPoints,
     const TopTools_DataMapOfShapeInteger& faceToIdMap,
     const std::string& savePath)
 {
+    std::vector<TopoDS_Compound> trueClosedCavities;
+
     // 1. 提取所有腔体面 ID 集合
     std::set<int> cavityFaceIds = CollectCavityFaceIds(allLayerFaces);
     if (cavityFaceIds.empty()) {
-        return;
+        return trueClosedCavities;
     }
 
     // 2. 得到纯粹的“型腔壳体”
@@ -3561,7 +3916,7 @@ void ProcessAndSplitClosedCavityFeatures(
 
     // 4. 生成高级特征表达
     std::vector<CavityFeature> cavityFeatures = GenerateCavityFeatures(isolatedCavities, allLayerFaces, splitPoints, faceToIdMap);
-    vector<TopoDS_Compound> trueClosedCavities;
+    
     for (const auto& feat : cavityFeatures) {
         // 智能剪裁：利用 topZ 解析切割，剔除超出开粗顶部的侧壁面（还原真正的工艺加工面）
         TopoDS_Compound trueCavity = ExtractTrueCavityFaces(feat, mainShape, faceToIdMap);
@@ -3576,22 +3931,16 @@ void ProcessAndSplitClosedCavityFeatures(
     for (size_t i = 0; i < trueClosedCavities.size(); ++i) {
         cout << "在处理第 [" << i << "] 个独立型腔区域..." << endl;
 
-        std::vector<TopoDS_Compound> parts = SplitCavity(trueClosedCavities[i]);
+        // 获取当前父型腔沿 Z 轴递推切分后的所有层
+        std::vector<TopoDS_Compound> parts = RecursiveSplitOpenCavity(trueClosedCavities[i]);
 
-        // 对每个切分结果进行邻接打散：同一Z层可能包含多个不连通的独立特征
-        std::vector<TopoDS_Compound> allSeparatedParts;
-        for (const auto& part : parts) {
-            std::vector<TopoDS_Compound> separated = SeparateDisconnectedCavities(part);
-            allSeparatedParts.insert(allSeparatedParts.end(), separated.begin(), separated.end());
-        }
-
-        std::vector<CavityFeature> converted = ConvertPartsToFeatures(allSeparatedParts, cavityFeatures[i], faceToIdMap);
+        std::vector<CavityFeature> converted = ConvertPartsToFeatures(parts, cavityFeatures[i], faceToIdMap);
 
         for (size_t k = 0; k < converted.size(); ++k) {
             converted[k].featureId = totalPartCount;
 
             std::string fileName = savePath + "Final_CAM_ClosedPart_" + std::to_string(totalPartCount) + ".brep";
-            BRepTools::Write(allSeparatedParts[k], fileName.c_str());
+            BRepTools::Write(parts[k], fileName.c_str());
 
             finalMachinableClosedFeatures.push_back(converted[k]);
 
@@ -3607,12 +3956,13 @@ void ProcessAndSplitClosedCavityFeatures(
         std::cout << "    - 包含 2D 层级切片数量: " << feat.stepLoops.size() << " 圈" << std::endl;
     }
 
+    return trueClosedCavities;
 }
 
 
 #if 1
 int main() {
-    std::string stepfile = "10_stp_stp.stp";
+    std::string stepfile = "7_stp_stp.stp";
 
     STEPControl_Reader reader;
     std::string inputFileName = inputPath + stepfile;
@@ -3709,8 +4059,6 @@ int main() {
 
     cout << "\n开始逐层切分模型 (从上往下)..." << endl;
     
-    // 用于累加最大轮廓面
-    //std::vector<Face2D> maxSilhouetteFaces;
     
     // 分离存储：封闭型腔和开放型腔的数据使用独立容器，避免混合污染
     std::vector<std::vector<Face2D>> allClosedLayerFaces;  // 封闭型腔专用
@@ -3856,62 +4204,11 @@ int main() {
         }
 
     }
-    // ================= 提取开放型腔特征面 =================
-    ProcessAndSplitOpenCavityFeatures(allOpenLayerFaces, allClosedLayerFaces, mainShape, splitPoints, faceToIdMap, savePath);
-
-
-
-
-
-
-
     // ================= 提取封闭型腔特征面 =================
-    ProcessAndSplitClosedCavityFeatures(allClosedLayerFaces, mainShape, splitPoints, faceToIdMap, savePath);
- //   cout << "\n=== 开始提取封闭型腔特征面 ===" << endl;
- //   std::set<int> cavityFaceIds = CollectCavityFaceIds(allLayerFaces);
- //   cout << "  检测到 " << cavityFaceIds.size() << " 个型腔面 ID" << endl;
- //   
- //   // 从原始实体模型中提取完整封闭型腔（侧壁 + 顶/底面/中间平台）
- //   std::string cavityFacesFileName = savePath + "CavityWallFaces.brep";
- //   ExportCavityFaces(mainShape, cavityFaceIds, faceToIdMap, cavityFacesFileName);
- //   cout << "  完整封闭型腔提取完成！" << endl;
+    auto trueClosedCavities = ProcessAndSplitClosedCavityFeatures(allClosedLayerFaces, mainShape, splitPoints, faceToIdMap, savePath);
 
- //   // 获取型腔合并面 Compound，供后续切割使用
- //   TopoDS_Compound cavityCompound = GetCavityCompound(mainShape, cavityFaceIds, faceToIdMap);
- //   
- //   // 拆分为独立的型腔区域 (独立连通体)
- //   std::vector<TopoDS_Compound> isolatedCavities = SeparateDisconnectedCavities(cavityCompound);
- //   cout << "识别到 " << isolatedCavities.size() << " 个独立的型腔区域。" << endl;
-
-	//// 得到型腔特征的表示（包含每个型腔对应的切片环信息）
- //   std::vector<CavityFeature> cavityFeatures = GenerateCavityFeatures(isolatedCavities, allLayerFaces, splitPoints, faceToIdMap);
-
- //   for (const auto& feat : cavityFeatures) {
- //       // 提取真正的型腔几何面
- //       TopoDS_Compound trueCavity = ExtractTrueCavityFaces(feat, mainShape, faceToIdMap);
-
- //       // 保存可视化
- //       string filePath = savePath + "Final_TrueCavity_" + to_string(feat.featureId) + ".brep";
- //       BRepTools::Write(trueCavity, filePath.c_str());
- //   }
-
- //   // 3. 对每个独立型腔分别进行 Z 轴切分
- //   int totalPartCount = 0;
- //   for (size_t i = 0; i < isolatedCavities.size(); ++i) {
- //       cout << "正在处理第 " << i << " 个型腔..." << endl;
-
- //       // 对当前独立区域调用你的 SplitCavity
- //       std::vector<TopoDS_Compound> parts = SplitCavity(isolatedCavities[i]);
-
- //       // 4. 保存结果
- //       for (size_t j = 0; j < parts.size(); ++j) {
- //           std::string fileName = savePath + "Cavity_" + std::to_string(i) + "_Part_" + std::to_string(j) + ".brep";
- //           BRepTools::Write(parts[j], fileName.c_str());
- //           totalPartCount++;
- //       }
- //   }
- //   cout << "全部处理完成，共生成 " << totalPartCount << " 个型腔零件。" << endl;
-
+    // ================= 提取开放型腔特征面 =================
+    ProcessAndSplitOpenCavityFeatures(allOpenLayerFaces, allClosedLayerFaces, trueClosedCavities, mainShape, splitPoints, faceToIdMap, savePath);
     
     cout << "\n所有切分完成！" << endl;
     cout << "生成的 BREP 文件保存在当前目录。" << endl;
