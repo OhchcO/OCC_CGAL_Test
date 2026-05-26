@@ -135,6 +135,14 @@ struct CavityFeature {
     std::set<int> sourceFaceIds; // 关联的原始面 ID 集合
 };
 
+//开放型腔筛选条件
+struct OpenCavityFilterParams {
+    double minArea          = 2.5; //面积
+    double minCompactness   = 0.015; //等周商，删去细长区域
+    double minToolPassSpan  = 1.0; //包围盒跨度，删去扁平的区域
+    double maxFilletRadius  = 5.0; //圆角半径
+};
+
 #include <fstream>
 #include <cstdlib>
 
@@ -2667,180 +2675,132 @@ double CalculateFaceCompactness(const Face2D& face)
     return compactness;
 }
 
-/**
- * @brief 【精密细化版】找准软边界宏观两端，通过硬壁趋势刺探圆角垃圾
- * @param face 已经通过 RecoverOriginalFaceIdsByGeometry 恢复了硬壁 ID、标记了 -1 软边的型腔面
- * @return true 代表是纯外壁圆角夹缝（需清洗）；false 代表是有效型腔（保留）
- */
-bool IsPureFilletSliverCavity_Advanced(const Face2D& face)
+// (IsPureFilletSliverCavity_Advanced 已被 BuildFilletRadiusMap + IsSmallFilletCavity 替代)
+std::map<int, double> BuildFilletRadiusMap(
+    const TopoDS_Shape& shape,
+    const TopTools_DataMapOfShapeInteger& faceToIdMap)
 {
-    size_t nSize = face.outerLoop.size();
-    if (nSize < 8) return false; // 边数太少直接放行，不构成复杂圆角条件
+    std::map<int, double> filletMap;
+    TopExp_Explorer exp(shape, TopAbs_FACE);
+    for (; exp.More(); exp.Next()) {
+        TopoDS_Face face = TopoDS::Face(exp.Current());
+        if (!faceToIdMap.IsBound(face)) continue;
+        int faceId = faceToIdMap.Find(face);
 
-    // ----------------────────────────────────────────=================
-    // 步骤 1：第一轮盘查，找出所有连续为 -1 的“软边界线段链”的宏观起点和终点下标
-    // ----------------------------------------------------------------=
-    struct SoftChain {
-        size_t macroStartIdx = 0; // 整个软边界链的第一根线段在 outerLoop 中的下标
-        size_t macroEndIdx = 0;   // 整个软边界链的最后一根线段在 outerLoop 中的下标
-    };
-    std::vector<SoftChain> chains;
+        BRepAdaptor_Surface surf(face);
+        double radius = -1.0;
 
-    bool inChain = false;
-    SoftChain currentChain;
-
-    for (size_t i = 0; i < nSize; ++i) {
-        if (face.outerLoop[i].faceId == -1) {
-            if (!inChain) {
-                currentChain.macroStartIdx = i;
-                inChain = true;
-            }
-            currentChain.macroEndIdx = i;
+        if (surf.GetType() == GeomAbs_Cylinder) {
+            radius = surf.Cylinder().Radius();
         }
-        else {
-            if (inChain) {
-                chains.push_back(currentChain);
-                inChain = false;
-            }
+        else if (surf.GetType() == GeomAbs_Torus) {
+            radius = surf.Torus().MinorRadius();
         }
+
+        filletMap[faceId] = radius;
     }
-    // 闭环处理：如果首尾在 -1 上连起来了
-    if (inChain) {
-        chains.push_back(currentChain);
-    }
-    // 如果首尾正好跨越了 0 点粘连，做一次安全合并
-    if (chains.size() > 1 && chains.front().macroStartIdx == 0 && chains.back().macroEndIdx == nSize - 1) {
-        chains.front().macroStartIdx = chains.back().macroStartIdx;
-        chains.pop_back();
-    }
-
-    // 如果这个圈压根没有软边界（全都是硬墙），说明是封闭内腔，绝对不能删
-    if (chains.empty()) return false;
-
-    // ----------------────────────────────────────────=================
-    // 步骤 2：针对每一条宏观软边界链，看它的“两端趋势”是否都被圆角包夹
-    // ----------------------------------------------------------------=
-    for (const auto& chain : chains) {
-
-        // =============================================================
-        // 🔎 探测【最初的起点端】：逆着拓扑环，从 macroStartIdx 往前穿透看 3 根硬线
-        // =============================================================
-        bool startSideIsFillet = false;
-
-        size_t sIdx = chain.macroStartIdx;
-        size_t prev1 = (sIdx == 0) ? nSize - 1 : sIdx - 1;
-        size_t prev2 = (prev1 == 0) ? nSize - 1 : prev1 - 1;
-        size_t prev3 = (prev2 == 0) ? nSize - 1 : prev2 - 1;
-
-        // 确保探测到的不是其他软边界线
-        if (face.outerLoop[prev1].faceId >= 0 && face.outerLoop[prev2].faceId >= 0 && face.outerLoop[prev3].faceId >= 0)
-        {
-            gp_XY pDir1(face.outerLoop[prev1].end.x - face.outerLoop[prev1].start.x, face.outerLoop[prev1].end.y - face.outerLoop[prev1].start.y);
-            gp_XY pDir2(face.outerLoop[prev2].end.x - face.outerLoop[prev2].start.x, face.outerLoop[prev2].end.y - face.outerLoop[prev2].start.y);
-            gp_XY pDir3(face.outerLoop[prev3].end.x - face.outerLoop[prev3].start.x, face.outerLoop[prev3].end.y - face.outerLoop[prev3].start.y);
-
-            if (pDir1.SquareModulus() > 1e-6 && pDir2.SquareModulus() > 1e-6 && pDir3.SquareModulus() > 1e-6) {
-                pDir1.Normalize(); pDir2.Normalize(); pDir3.Normalize();
-
-                double dotPrev1 = pDir1.Dot(pDir2);
-                double dotPrev2 = pDir2.Dot(pDir3);
-                double totalPrevDot = pDir1.Dot(pDir3); // 宏观大方向改变趋势
-
-                // ⚖️ 趋势判据：每一步都是平缓连接（>165°），但走完3步后，总方向发生了明确偏转（totalDot < 0.985），说明踩中圆角趋势
-                if (dotPrev1 > 0.98 && dotPrev2 > 0.98 && (totalPrevDot > 0.88 && totalPrevDot < 0.985)) {
-                    startSideIsFillet = true;
-                }
-            }
-        }
-
-        // =============================================================
-        // 🔎 探测【最初的终点端】：顺着拓扑环，从 macroEndIdx 往后穿透看 3 根硬线
-        // =============================================================
-        bool endSideIsFillet = false;
-
-        size_t eIdx = chain.macroEndIdx;
-        size_t next1 = (eIdx + 1) % nSize;
-        size_t next2 = (next1 + 1) % nSize;
-        size_t next3 = (next2 + 1) % nSize;
-
-        if (face.outerLoop[next1].faceId >= 0 && face.outerLoop[next2].faceId >= 0 && face.outerLoop[next3].faceId >= 0)
-        {
-            gp_XY nDir1(face.outerLoop[next1].end.x - face.outerLoop[next1].start.x, face.outerLoop[next1].end.y - face.outerLoop[next1].start.y);
-            gp_XY nDir2(face.outerLoop[next2].end.x - face.outerLoop[next2].start.x, face.outerLoop[next2].end.y - face.outerLoop[next2].start.y);
-            gp_XY nDir3(face.outerLoop[next3].end.x - face.outerLoop[next3].start.x, face.outerLoop[next3].end.y - face.outerLoop[next3].start.y);
-
-            if (nDir1.SquareModulus() > 1e-6 && nDir2.SquareModulus() > 1e-6 && nDir3.SquareModulus() > 1e-6) {
-                nDir1.Normalize(); nDir2.Normalize(); nDir3.Normalize();
-
-                double dotNext1 = nDir1.Dot(nDir2);
-                double dotNext2 = nDir2.Dot(nDir3);
-                double totalNextDot = nDir1.Dot(nDir3); // 宏观大方向改变趋势
-
-                if (dotNext1 > 0.98 && dotNext2 > 0.98 && (totalNextDot > 0.88 && totalNextDot < 0.985)) {
-                    endSideIsFillet = true;
-                }
-            }
-        }
-
-        // =============================================================
-        // ⚖️ 【工艺终审裁决】
-        // 如果当前这条完整的宏观软边界链，它的最初起点和最初终点，同时咬死在圆角的转弯趋势里
-        // 证实它是由于工件外壁圆角大擦边产生的梭形伪腔，判定为垃圾面，立刻返回 true 下死手！
-        // =============================================================
-        if (startSideIsFillet && endSideIsFillet) {
-            return true;
-        }
-    }
-
-    return false; // 通过了考核，是个含有直壁的良民型腔
+    return filletMap;
 }
-/**
- * @brief 【工艺总接口】全量开放型腔多边形综合清洗大管家
- * @param rawOpenCavities Clipper2 计算出来并排除了重叠内腔的原始开口型腔面总集
- * @return 过滤清洗干净、可以直接下刀生成刀轨的真正高质量加工型腔数组
- */
-std::vector<Face2D> CleanAndFilterOpenCavities(const std::vector<Face2D>& rawOpenCavities)
+
+
+bool IsSmallFilletCavity(
+    const Face2D& face,
+    const std::map<int, double>& filletMap,
+    double maxFilletRadius)
+{
+    const auto& loop = face.outerLoop;
+    if (loop.empty()) return false;
+
+    bool hasVirtualEdge = false;
+    for (const auto& line : loop) {
+        if (line.faceId == -1) {
+            hasVirtualEdge = true;
+            break;
+        }
+    }
+    if (!hasVirtualEdge) return false;
+
+    std::set<int> edgeNeighborIds;
+    for (size_t i = 0; i < loop.size(); i++) {
+        if (loop[i].faceId != -1) continue;
+
+        size_t prevIdx = (i == 0) ? loop.size() - 1 : i - 1;
+        size_t nextIdx = (i + 1) % loop.size();
+
+        if (loop[prevIdx].faceId >= 0) {
+            edgeNeighborIds.insert(loop[prevIdx].faceId);
+        }
+        if (loop[nextIdx].faceId >= 0) {
+            edgeNeighborIds.insert(loop[nextIdx].faceId);
+        }
+    }
+
+    if (edgeNeighborIds.empty()) return false;
+
+    for (int fid : edgeNeighborIds) {
+        auto it = filletMap.find(fid);
+        if (it == filletMap.end() || it->second <= 0 || it->second >= maxFilletRadius) {
+            return false;
+        }
+    }
+    return true;
+}
+
+
+std::vector<Face2D> CleanAndFilterOpenCavities(
+    const std::vector<Face2D>& rawOpenCavities,
+    const std::map<int, double>& filletMap,
+    const OpenCavityFilterParams& params = OpenCavityFilterParams{})
 {
     std::vector<Face2D> clearFeatures;
 
-    // --- 🔑 工艺大闸门参数定义 ---
-    const double MIN_AREA = 2.5;         // 门槛 1：面积小于 2.5 平方毫米的纳米残渣直接蒸发
-    const double MIN_COMPACTNESS = 0.015; // 门槛 2：等周商小于 0.015 的极其骨感的超级长尾巴单线直接蒸发
-    const double MIN_TOOL_PASS_SPAN = 1.0; // 门槛 3：包围盒跨度小于 1mm 的微观伪胖正方形直接剔除
-
+    int idx = 0;
     for (const auto& face : rawOpenCavities) {
-        if (face.outerLoop.size() < 3) continue;
+        idx++;
+        if (face.outerLoop.size() < 3) {
+            std::cout << "  ❌ 型腔#" << idx << " 被过滤: 顶点数不足 ("
+                << face.outerLoop.size() << " < 3)" << std::endl;
+            continue;
+        }
 
-        // 🟢 1. 拦截极小面积碎屑
         double area = CalculateArea(face.outerLoop);
-        if (area < MIN_AREA) continue;
+        if (area < params.minArea) {
+            std::cout << "  ❌ 型腔#" << idx << " 被过滤: 面积过小 ("
+                << area << " < " << params.minArea << ")" << std::endl;
+            continue;
+        }
 
-        // 🟢 2. 拦截骨感僵尸长尾巴
         double compactness = CalculateFaceCompactness(face);
-        if (compactness < MIN_COMPACTNESS) continue;
+        if (compactness < params.minCompactness) {
+            std::cout << "  ❌ 型腔#" << idx << " 被过滤: 等周商过小/细长 ("
+                << compactness << " < " << params.minCompactness << ")" << std::endl;
+            continue;
+        }
 
-        // 🟢 3. 拦截微观过小面积盲区（应用快速外接框跨度校验）
         double xMin = 1e9, xMax = -1e9, yMin = 1e9, yMax = -1e9;
         for (const auto& line : face.outerLoop) {
             xMin = std::min(xMin, line.start.x); xMax = std::max(xMax, line.start.x);
             yMin = std::min(yMin, line.start.y); yMax = std::max(yMax, line.start.y);
         }
-        if ((xMax - xMin) < MIN_TOOL_PASS_SPAN && (yMax - yMin) < MIN_TOOL_PASS_SPAN) {
+        if ((xMax - xMin) < params.minToolPassSpan && (yMax - yMin) < params.minToolPassSpan) {
+            std::cout << "  ❌ 型腔#" << idx << " 被过滤: 包围盒跨度不足 ("
+                << (xMax - xMin) << " x " << (yMax - yMin) << " < " << params.minToolPassSpan << ")" << std::endl;
             continue;
         }
 
-        // 🟢 4. 🚀 🔥【终极绝杀】：执行你提出来的软边界双端连通圆角穿透检查
-        // 如果证明它只是外壁大圆角的顺滑擦边伪区域，直接就地物理毁灭！
-        if (IsPureFilletSliverCavity_Advanced(face)) {
+        if (IsSmallFilletCavity(face, filletMap, params.maxFilletRadius)) {
+            std::cout << "  ❌ 型腔#" << idx << " 被过滤: 小圆角特征 (半径 < " << params.maxFilletRadius << ")" << std::endl;
             continue;
         }
 
-        // 🏆 恭喜它！闯过四道鬼门关，证明是绝对需要开粗的良民多边形，准予放行！
+        std::cout << "  ✅ 型腔#" << idx << " 通过: 面积=" << area
+            << " 等周商=" << compactness
+            << " 跨度=" << (xMax - xMin) << "x" << (yMax - yMin) << std::endl;
         clearFeatures.push_back(face);
     }
 
     std::cout << "🏁 [工艺提纯报告] 原本共有型腔碎片: " << rawOpenCavities.size()
-        << " 个 -> 经过四大滤网刚性清算后，最终存活黄金型腔: " << clearFeatures.size() << " 个！" << std::endl;
+        << " 个 -> 过滤后最终存活型腔: " << clearFeatures.size() << " 个！" << std::endl;
 
     return clearFeatures;
 }
@@ -2870,8 +2830,7 @@ std::set<int> CollectOpenCavityFaceIds(const std::vector<std::vector<Face2D>>& a
 TopoDS_Compound GetOpenCavityCapFaces(const TopoDS_Shape& solid,
     const std::set<int>& openFaceIds,
     const TopTools_DataMapOfShapeInteger& faceToIdMap,
-    double angleTolerance = 0.001,
-    gp_Dir toolDirection = gp_Dir(0, 0, -1)) {
+    double angleTolerance = 0.001) {
     BRep_Builder builder;
     TopoDS_Compound capFaces;
     builder.MakeCompound(capFaces);
@@ -2879,9 +2838,6 @@ TopoDS_Compound GetOpenCavityCapFaces(const TopoDS_Shape& solid,
     TopTools_IndexedDataMapOfShapeListOfShape edgeToFaces;
     TopExp::MapShapesAndAncestors(solid, TopAbs_EDGE, TopAbs_FACE, edgeToFaces);
 
-    // =========================================================================
-    // ⚖️ 步骤 A：宏观清算 —— 算出当前开放侧壁在 3D 空间中的真正 Z 轴极限
-    // =========================================================================
     double wallMinZ = 1e9;
     double wallMaxZ = -1e9;
     bool hasValidWalls = false;
@@ -2893,7 +2849,7 @@ TopoDS_Compound GetOpenCavityCapFaces(const TopoDS_Shape& solid,
             int id = faceToIdMap.Find(f);
             if (openFaceIds.count(id)) {
                 double zmin, zmax;
-                GetFaceZRange(f, zmin, zmax); // 借用你原有的 Z 范围函数
+                GetFaceZRange(f, zmin, zmax);
                 wallMinZ = std::min(wallMinZ, zmin);
                 wallMaxZ = std::max(wallMaxZ, zmax);
                 hasValidWalls = true;
@@ -2901,15 +2857,12 @@ TopoDS_Compound GetOpenCavityCapFaces(const TopoDS_Shape& solid,
         }
     }
 
-    // 如果这一层连开放侧壁都丢了，直接退出
     if (!hasValidWalls) return capFaces;
 
-    // =========================================================================
-    // ⚖️ 步骤 B：微观盘查 —— 带着法向大闸门筛选真正的工艺底面
-    // =========================================================================
     const gp_Dir zAxis(0, 0, 1);
-    TopExp_Explorer exp(solid, TopAbs_FACE);
+    const double zTol = 0.1;
 
+    TopExp_Explorer exp(solid, TopAbs_FACE);
     for (; exp.More(); exp.Next()) {
         TopoDS_Face face = TopoDS::Face(exp.Current());
         BRepAdaptor_Surface surf(face);
@@ -2917,13 +2870,11 @@ TopoDS_Compound GetOpenCavityCapFaces(const TopoDS_Shape& solid,
 
         gp_Pln plane = surf.Plane();
         gp_Dir normal = plane.Axis().Direction();
-
-        // 关键：获取面在中心点处的准确法线方向（处理好 REVERSED 取反）
         if (face.Orientation() == TopAbs_REVERSED) {
             normal.Reverse();
         }
 
-        // 1. 🔍 水平大闸门：法线必须平行于 Z 轴
+        // 过滤1：只保留水平面（法线平行于Z轴）
         double angle = normal.Angle(zAxis);
         if (angle > angleTolerance && fabs(angle - M_PI) > angleTolerance) continue;
 
@@ -2931,23 +2882,19 @@ TopoDS_Compound GetOpenCavityCapFaces(const TopoDS_Shape& solid,
         if (faceToIdMap.IsBound(face)) faceId = faceToIdMap.Find(face);
         else continue;
 
-        // 2. 🔍 顶面判断：用法向与进刀方向的点积关系来决定
-        //    dot(normal, toolDirection) > 0 → 法向与进刀同向 → 天花板/悬垂面 → 保留
-        //    dot(normal, toolDirection) < 0 → 法向与进刀反向 → 天空开口面 → 丢弃
         double faceZ = plane.Location().Z();
-        double dotWithTool = normal.X() * toolDirection.X() + normal.Y() * toolDirection.Y() + normal.Z() * toolDirection.Z();
-        if (std::abs(faceZ - wallMaxZ) < 0.1 && dotWithTool < 0) {
+
+        // 过滤2：顶面（wallMaxZ附近）只保留法向朝下的面
+        if (std::abs(faceZ - wallMaxZ) < zTol && normal.Z() > -0.99) {
             continue;
         }
 
-        // 3. 🔍 底面法向判据
-        // 模型的实体法向【必须严格朝上】(normal.Z() > 0.99)！
-        // 如果通槽下方悬空导致邻接到了工件大底面，大底面法向朝下(Z = -1)，在这里会被直接过滤掉，完美防错！
-        if (normal.Z() < 0.99) {
+        // 过滤3：底面（wallMinZ附近）只保留法向朝上的面
+        if (std::abs(faceZ - wallMinZ) < zTol && normal.Z() < 0.99) {
             continue;
         }
 
-        // 4. 🔍 拓扑比对：检查这个法向朝上的底面是否真的贴着开放侧壁
+        // 过滤4：邻接面必须属于型腔面集合
         bool hasOpenCavityNeighbor = false;
         TopExp_Explorer edgeExp(face, TopAbs_EDGE);
         for (; edgeExp.More(); edgeExp.Next()) {
@@ -2959,7 +2906,6 @@ TopoDS_Compound GetOpenCavityCapFaces(const TopoDS_Shape& solid,
 
                 if (faceToIdMap.IsBound(adjFace)) {
                     int adjId = faceToIdMap.Find(adjFace);
-                    // 只要有一侧邻接了我们认可的有效开放型腔侧壁
                     if (openFaceIds.count(adjId)) {
                         hasOpenCavityNeighbor = true;
                         break;
@@ -2969,11 +2915,9 @@ TopoDS_Compound GetOpenCavityCapFaces(const TopoDS_Shape& solid,
             if (hasOpenCavityNeighbor) break;
         }
 
-        // 5. 🔍 极限区间校准：底面的高度，必须落在侧壁的合理跨度区间内
+        // 通过所有过滤的面加入结果集
         if (hasOpenCavityNeighbor && faceId >= 0) {
-            if (faceZ >= wallMinZ - 0.1 && faceZ <= wallMaxZ + 0.1) {
-                builder.Add(capFaces, face);
-            }
+            builder.Add(capFaces, face);
         }
     }
 
@@ -3706,11 +3650,16 @@ std::pair<TopoDS_Compound, TopoDS_Compound> SplitCompoundAtZ(
     return { upper, lower };
 }
 
-std::vector<TopoDS_Compound> RecursiveSplitOpenCavity(const TopoDS_Compound& cavity) {
+std::vector<TopoDS_Compound> RecursiveSplitCavity(const TopoDS_Compound& cavity) {
     std::vector<TopoDS_Compound> result;
 
     TopTools_IndexedDataMapOfShapeListOfShape edgeToFaces;
     TopExp::MapShapesAndAncestors(cavity, TopAbs_EDGE, TopAbs_FACE, edgeToFaces);
+
+    Bnd_Box cavityBox;
+    BRepBndLib::Add(cavity, cavityBox);
+    double xmin, ymin, zmin, xmax, ymax, topZ;
+    cavityBox.Get(xmin, ymin, zmin, xmax, ymax, topZ);
 
     std::set<double> zSet;
     TopExp_Explorer exp(cavity, TopAbs_FACE);
@@ -3719,6 +3668,8 @@ std::vector<TopoDS_Compound> RecursiveSplitOpenCavity(const TopoDS_Compound& cav
         if (!IsHorizontalFace(f)) continue;
 
         double zFace = GetHorizontalFaceZ(f);
+        if (std::abs(zFace - topZ) < 1e-3) continue;
+
         bool isIntermediateStep = false;
 
         TopExp_Explorer edgeExp(f, TopAbs_EDGE);
@@ -3761,11 +3712,11 @@ std::vector<TopoDS_Compound> RecursiveSplitOpenCavity(const TopoDS_Compound& cav
 
     if (lowerParts.size() > 1) {
         for (const auto& part : lowerParts) {
-            auto subResult = RecursiveSplitOpenCavity(part);
+            auto subResult = RecursiveSplitCavity(part);
             result.insert(result.end(), subResult.begin(), subResult.end());
         }
     } else {
-        auto subResult = RecursiveSplitOpenCavity(lower);
+        auto subResult = RecursiveSplitCavity(lower);
         result.insert(result.end(), subResult.begin(), subResult.end());
     }
 
@@ -3804,6 +3755,11 @@ void ProcessAndSplitOpenCavityFeatures(
     TopoDS_Compound cavityCompound = GetOpenCavityCompound(mainShape, openFaceIds, faceToIdMap);
 
 
+    // 保存为 brep 文件
+    std::string cavityCompoundFileName = savePath + "OpenCavityCompound.brep";
+    BRepTools::Write(cavityCompound, cavityCompoundFileName.c_str());
+    std::cout << "  开放型腔合并面已保存至: " << cavityCompoundFileName << std::endl;
+
     // 3. BFS 拓扑连通体打散
     std::vector<TopoDS_Compound> isolatedCavities = SeparateDisconnectedCavities(cavityCompound);
     cout << "    [拓扑分析] 成功将开放合并面打散为 " << isolatedCavities.size() << " 个空间独立的开放区域。" << endl;
@@ -3827,7 +3783,7 @@ void ProcessAndSplitOpenCavityFeatures(
     for (size_t i = 0; i < trueOpenCavities.size(); ++i) {
 
         // 获取当前父型腔沿 Z 轴递推切分后的所有层
-        std::vector<TopoDS_Compound> zLayers = RecursiveSplitOpenCavity(trueOpenCavities[i]);
+        std::vector<TopoDS_Compound> zLayers = RecursiveSplitCavity(trueOpenCavities[i]);
 
         for (size_t j = 0; j < zLayers.size(); ++j) {
 
@@ -3932,7 +3888,7 @@ std::vector<TopoDS_Compound> ProcessAndSplitClosedCavityFeatures(
         cout << "在处理第 [" << i << "] 个独立型腔区域..." << endl;
 
         // 获取当前父型腔沿 Z 轴递推切分后的所有层
-        std::vector<TopoDS_Compound> parts = RecursiveSplitOpenCavity(trueClosedCavities[i]);
+        std::vector<TopoDS_Compound> parts = RecursiveSplitCavity(trueClosedCavities[i]);
 
         std::vector<CavityFeature> converted = ConvertPartsToFeatures(parts, cavityFeatures[i], faceToIdMap);
 
@@ -3962,7 +3918,7 @@ std::vector<TopoDS_Compound> ProcessAndSplitClosedCavityFeatures(
 
 #if 1
 int main() {
-    std::string stepfile = "7_stp_stp.stp";
+    std::string stepfile = "3_stp_stp.stp";
 
     STEPControl_Reader reader;
     std::string inputFileName = inputPath + stepfile;
@@ -3985,7 +3941,10 @@ int main() {
         }
     }
     cout << "已为 " << currentFaceId - 1 << " 个面分配了 ID。" << endl;
-    
+
+    std::map<int, double> filletMap = BuildFilletRadiusMap(mainShape, faceToIdMap);
+    cout << "已建立圆角半径映射，共 " << filletMap.size() << " 个面。" << endl;
+
     std::vector<double> splitPoints = GetSplitPointsAlongZ(mainShape);
     
     cout << "检测到 " << splitPoints.size() << " 个切分点:" << endl;
@@ -4172,7 +4131,7 @@ int main() {
             std::string softEdgesName = savePath + "Slice_" + std::to_string(i) + "_ONLY_SoftEdges_Z" + std::to_string(splitZ) + ".brep";
             ExportSoftEdgesToBrep(tempOpenCavityFaces, softEdgesName);
 
-            vector<Face2D> currentOpenCavityFaces = CleanAndFilterOpenCavities(tempOpenCavityFaces);
+            vector<Face2D> currentOpenCavityFaces = CleanAndFilterOpenCavities(tempOpenCavityFaces, filletMap);
 
             //debug 
             for(auto& f : currentOpenCavityFaces) {
