@@ -5,6 +5,7 @@
 #include <map>
 #include <unordered_map>
 #include <cmath>
+#include <limits>
 
 //CGAL 库用于计算凸包
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
@@ -140,7 +141,83 @@ struct OpenCavityFilterParams {
     double minArea          = 2.5; //面积
     double minCompactness   = 0.015; //等周商，删去细长区域
     double minToolPassSpan  = 1.0; //包围盒跨度，删去扁平的区域
-    double maxFilletRadius  = 5.0; //圆角半径
+    double maxFilletRadius  = 4.0; //圆角半径
+    double hullMergeDistance = 360.0; //独立凸包链式合并距离阈值
+    double bboxPrecheckMargin = 0.0; //凸包距离粗筛额外余量
+};
+
+struct OpenCavitySplitParams {
+    double minStepFaceArea = 5.0; //开放型腔切分台阶面的最小面积
+    double zProtectionTol = 0.05; //保护顶面/底面，避免贴边切碎
+    double neighborZTol = 1e-3; //判断邻接面上下延伸的 Z 容差
+    double minSplitGap = 0.2; //过近切分高度合并
+    double geometricConnectTol = 0.05; //开放型腔拓扑断开后的几何连通合并容差
+    int maxRecursionDepth = 32; //防止异常模型无限递推
+    bool splitDownOnlyStepFaces = true; //凸台顶面/岛顶面只有下方邻接时也作为切分面
+    bool exportDebugBreps = true;
+};
+
+struct HullItem {
+    Face2D hull;
+    Face2D solid;
+    int index = -1;
+};
+
+struct HullGroup {
+    std::vector<int> memberIndices;
+    double triggerDistance = 0.0;
+};
+
+struct LoopBBox2D {
+    double xMin = 0.0;
+    double yMin = 0.0;
+    double xMax = 0.0;
+    double yMax = 0.0;
+    bool valid = false;
+};
+
+struct UnionFind {
+    std::vector<int> parent;
+    std::vector<int> rank;
+    std::vector<double> triggerDistance;
+
+    UnionFind(int n = 0) {
+        Reset(n);
+    }
+
+    void Reset(int n) {
+        parent.resize(n);
+        rank.assign(n, 0);
+        triggerDistance.assign(n, std::numeric_limits<double>::max());
+        for (int i = 0; i < n; ++i) {
+            parent[i] = i;
+        }
+    }
+
+    int Find(int x) {
+        if (parent[x] != x) {
+            parent[x] = Find(parent[x]);
+        }
+        return parent[x];
+    }
+
+    void Unite(int a, int b, double distance) {
+        int rootA = Find(a);
+        int rootB = Find(b);
+        if (rootA == rootB) {
+            triggerDistance[rootA] = std::min(triggerDistance[rootA], distance);
+            return;
+        }
+        if (rank[rootA] < rank[rootB]) {
+            std::swap(rootA, rootB);
+        }
+        parent[rootB] = rootA;
+        triggerDistance[rootA] = std::min(triggerDistance[rootA], triggerDistance[rootB]);
+        triggerDistance[rootA] = std::min(triggerDistance[rootA], distance);
+        if (rank[rootA] == rank[rootB]) {
+            rank[rootA]++;
+        }
+    }
 };
 
 #include <fstream>
@@ -1096,6 +1173,29 @@ TopoDS_Compound GetCavityCapFaces(const TopoDS_Shape& solid,
     return capFaces;
 }
 
+// 将纯数学线段集合保存为 BREP 文件，用于可视化验证
+void ExportOneLinesToBrep(const std::vector<OneLine>& lines, const std::string& fileName) {
+    if (lines.empty()) return;
+
+    BRep_Builder builder;
+    TopoDS_Compound comp;
+    builder.MakeCompound(comp);
+
+    for (const auto& line : lines) {
+        gp_Pnt p1(line.start.x, line.start.y, line.start.z);
+        gp_Pnt p2(line.end.x, line.end.y, line.end.z);
+
+        // 防止起点和终点重合导致 MakeEdge 失败
+        if (!p1.IsEqual(p2, 1e-7)) {
+            TopoDS_Edge anEdge = BRepBuilderAPI_MakeEdge(p1, p2);
+            builder.Add(comp, anEdge);
+        }
+    }
+
+    BRepTools::Write(comp, fileName.c_str());
+    cout << "  打散后的线段已保存至: " << fileName << endl;
+}
+
 // 保存整个封闭型腔（侧壁 + 顶/底面）为 BREP
 void ExportCavityFaces(const TopoDS_Shape& solid,
                         const std::set<int>& cavityFaceIds,
@@ -1148,42 +1248,221 @@ TopoDS_Compound GetCavityCompound(const TopoDS_Shape& solid,
 // 去重：删除完全重复的线段（关键！解决假环）
 vector<OneLine> DeduplicateLines(const vector<OneLine>& lines) {
     vector<OneLine> res;
+    int duplicateCount = 0;
+    int reverseDuplicateCount = 0;
+
+    auto MergePoint = [](Point3D& target, const Point3D& incoming) {
+        target.x = (target.x + incoming.x) * 0.5;
+        target.y = (target.y + incoming.y) * 0.5;
+        target.z = (target.z + incoming.z) * 0.5;
+    };
+
     for (const auto& line : lines) {
         bool dup = false;
-        for (const auto& r : res) {
+        for (auto& r : res) {
             if (IsPointEqual(line.start, r.start) && IsPointEqual(line.end, r.end)) {
+                MergePoint(r.start, line.start);
+                MergePoint(r.end, line.end);
+                if (r.faceId < 0 && line.faceId >= 0) r.faceId = line.faceId;
                 dup = true;
+                duplicateCount++;
                 break;
             }
             if (IsPointEqual(line.start, r.end) && IsPointEqual(line.end, r.start)) {
+                MergePoint(r.start, line.end);
+                MergePoint(r.end, line.start);
+                if (r.faceId < 0 && line.faceId >= 0) r.faceId = line.faceId;
                 dup = true;
+                reverseDuplicateCount++;
                 break;
             }
         }
         if (!dup) res.push_back(line);
     }
+    if (duplicateCount > 0 || reverseDuplicateCount > 0) {
+        cout << "  [DeduplicateLines] 输入=" << lines.size()
+            << " 输出=" << res.size()
+            << " 同向重复=" << duplicateCount
+            << " 反向重复=" << reverseDuplicateCount << endl;
+    }
     return res;
+}
+
+void PrintEndpointGapDiagnostics(const std::vector<OneLine>& lines, double snapTol) {
+    struct EndpointInfo {
+        Point3D p;
+        int lineIndex = -1;
+        bool isStart = true;
+        int degree = 0;
+    };
+
+    std::vector<EndpointInfo> endpoints;
+    endpoints.reserve(lines.size() * 2);
+    for (int i = 0; i < (int)lines.size(); ++i) {
+        endpoints.push_back({ lines[i].start, i, true, 0 });
+        endpoints.push_back({ lines[i].end, i, false, 0 });
+    }
+
+    for (size_t i = 0; i < endpoints.size(); ++i) {
+        for (size_t j = i + 1; j < endpoints.size(); ++j) {
+            double dx = endpoints[i].p.x - endpoints[j].p.x;
+            double dy = endpoints[i].p.y - endpoints[j].p.y;
+            double dist = std::sqrt(dx * dx + dy * dy);
+            if (dist < snapTol) {
+                endpoints[i].degree++;
+                endpoints[j].degree++;
+            }
+        }
+    }
+
+    int openEndpointCount = 0;
+    double maxNearestGap = 0.0;
+    std::cout << "  [BuildLoops诊断] 未用线段端点断口:" << std::endl;
+    for (size_t i = 0; i < endpoints.size(); ++i) {
+        if (endpoints[i].degree > 0) continue;
+        openEndpointCount++;
+
+        double bestDist = std::numeric_limits<double>::max();
+        int bestIndex = -1;
+        for (size_t j = 0; j < endpoints.size(); ++j) {
+            if (i == j) continue;
+            double dx = endpoints[i].p.x - endpoints[j].p.x;
+            double dy = endpoints[i].p.y - endpoints[j].p.y;
+            double dist = std::sqrt(dx * dx + dy * dy);
+            if (dist < bestDist) {
+                bestDist = dist;
+                bestIndex = (int)j;
+            }
+        }
+
+        maxNearestGap = std::max(maxNearestGap, bestDist);
+        std::cout << "    line=" << endpoints[i].lineIndex
+            << (endpoints[i].isStart ? ".start" : ".end")
+            << " p=(" << endpoints[i].p.x << "," << endpoints[i].p.y << "," << endpoints[i].p.z << ")"
+            << " nearest=" << bestDist;
+        if (bestIndex >= 0) {
+            std::cout << " -> line=" << endpoints[bestIndex].lineIndex
+                << (endpoints[bestIndex].isStart ? ".start" : ".end")
+                << " p=(" << endpoints[bestIndex].p.x << "," << endpoints[bestIndex].p.y << "," << endpoints[bestIndex].p.z << ")";
+        }
+        std::cout << std::endl;
+    }
+
+    std::cout << "  [BuildLoops诊断] openEndpointCount=" << openEndpointCount
+        << " maxNearestGap=" << maxNearestGap
+        << " snapTol=" << snapTol << std::endl;
+}
+
+int HealOpenEndpointGaps(std::vector<OneLine>& lines, double healTol) {
+    struct EndpointRef {
+        int lineIndex = -1;
+        bool isStart = true;
+        Point3D p;
+        int degree = 0;
+    };
+
+    auto Distance2DLocal = [](const Point3D& a, const Point3D& b) {
+        double dx = a.x - b.x;
+        double dy = a.y - b.y;
+        return std::sqrt(dx * dx + dy * dy);
+    };
+
+    std::vector<EndpointRef> endpoints;
+    endpoints.reserve(lines.size() * 2);
+    for (int i = 0; i < (int)lines.size(); ++i) {
+        endpoints.push_back({ i, true, lines[i].start, 0 });
+        endpoints.push_back({ i, false, lines[i].end, 0 });
+    }
+
+    for (size_t i = 0; i < endpoints.size(); ++i) {
+        for (size_t j = i + 1; j < endpoints.size(); ++j) {
+            if (Distance2DLocal(endpoints[i].p, endpoints[j].p) < 1e-3) {
+                endpoints[i].degree++;
+                endpoints[j].degree++;
+            }
+        }
+    }
+
+    int healedCount = 0;
+    std::vector<bool> endpointHealed(endpoints.size(), false);
+    while (true) {
+        int bestA = -1;
+        int bestB = -1;
+        double bestDist = healTol;
+
+        for (int a = 0; a < (int)endpoints.size(); ++a) {
+            if (endpointHealed[a] || endpoints[a].degree > 0) continue;
+            for (int b = a + 1; b < (int)endpoints.size(); ++b) {
+                if (endpointHealed[b] || endpoints[b].degree > 0) continue;
+                if (endpoints[a].lineIndex == endpoints[b].lineIndex) continue;
+
+                double dist = Distance2DLocal(endpoints[a].p, endpoints[b].p);
+                if (dist <= bestDist) {
+                    bestDist = dist;
+                    bestA = a;
+                    bestB = b;
+                }
+            }
+        }
+
+        if (bestA < 0 || bestB < 0) break;
+
+        Point3D mergedPoint;
+        mergedPoint.x = (endpoints[bestA].p.x + endpoints[bestB].p.x) * 0.5;
+        mergedPoint.y = (endpoints[bestA].p.y + endpoints[bestB].p.y) * 0.5;
+        mergedPoint.z = (endpoints[bestA].p.z + endpoints[bestB].p.z) * 0.5;
+
+        auto ApplyEndpoint = [&](const EndpointRef& endpoint) {
+            if (endpoint.isStart) {
+                lines[endpoint.lineIndex].start = mergedPoint;
+            }
+            else {
+                lines[endpoint.lineIndex].end = mergedPoint;
+            }
+        };
+
+        ApplyEndpoint(endpoints[bestA]);
+        ApplyEndpoint(endpoints[bestB]);
+        endpointHealed[bestA] = true;
+        endpointHealed[bestB] = true;
+        healedCount++;
+    }
+
+    return healedCount;
 }
 
 // 核心成环算法：只找大环，自动忽略碎线
 vector<Loop> BuildLoops(const vector<OneLine>& inputLines) {
     vector<Loop> loops;
-    auto lines = DeduplicateLines(inputLines);
+    vector<OneLine> lines = DeduplicateLines(inputLines);
+    int healedCount = HealOpenEndpointGaps(lines, 0.02);
+    if (healedCount > 0) {
+        cout << "  [BuildLoops] 端点断口愈合数量: " << healedCount
+            << " (healTol=0.02mm)" << endl;
+    }
+    //debug 
+    //std::string Name = savePath + "Slice_debug_line.brep";
+    //ExportOneLinesToBrep(lines, Name);
+
     if (lines.empty()) return loops;
 
     vector<bool> visited(lines.size(), false);
-    const double snapTol = 1e-3;
+    const double snapTol = 0.001;
 
     auto Snap = [](const Point3D& p, double tol) -> std::pair<int64_t, int64_t> {
         return { (int64_t)round(p.x / tol), (int64_t)round(p.y / tol) };
+    };
+
+    auto MakeSnapKey = [](int64_t x, int64_t y) -> int64_t {
+        return x * 1000000007LL + y;
     };
 
     std::unordered_map<int64_t, std::vector<size_t>> endMap;
     for (size_t i = 0; i < lines.size(); ++i) {
         auto sk = Snap(lines[i].start, snapTol);
         auto ek = Snap(lines[i].end, snapTol);
-        int64_t startKey = sk.first * 1000000007LL + sk.second;
-        int64_t endKey = ek.first * 1000000007LL + ek.second;
+        int64_t startKey = MakeSnapKey(sk.first, sk.second);
+        int64_t endKey = MakeSnapKey(ek.first, ek.second);
         endMap[startKey].push_back(i);
         if (startKey != endKey) {
             endMap[endKey].push_back(i);
@@ -1194,38 +1473,47 @@ vector<Loop> BuildLoops(const vector<OneLine>& inputLines) {
         if (visited[i]) continue;
 
         Loop currentLoop;
+        std::vector<size_t> trialIndices;
+        std::vector<bool> trialUsed(lines.size(), false);
+
         currentLoop.push_back(lines[i]);
-        visited[i] = true;
+        trialIndices.push_back(i);
+        trialUsed[i] = true;
         Point3D startPt = lines[i].start;
         Point3D currEnd = lines[i].end;
 
         while (true) {
             auto key = Snap(currEnd, snapTol);
-            int64_t mapKey = key.first * 1000000007LL + key.second;
 
             size_t bestIdx = SIZE_MAX;
             double bestDist = 1e9;
             bool bestReverse = false;
 
-            auto it = endMap.find(mapKey);
-            if (it != endMap.end()) {
-                for (size_t idx : it->second) {
-                    if (visited[idx]) continue;
-                    const auto& l = lines[idx];
-                    double dS = fabs(currEnd.x - l.start.x) + fabs(currEnd.y - l.start.y);
-                    double dE = fabs(currEnd.x - l.end.x) + fabs(currEnd.y - l.end.y);
-                    if (dS < snapTol && dS < bestDist) {
-                        bestDist = dS; bestIdx = idx; bestReverse = false;
-                    }
-                    if (dE < snapTol && dE < bestDist) {
-                        bestDist = dE; bestIdx = idx; bestReverse = true;
+            for (int dx = -1; dx <= 1; ++dx) {
+                for (int dy = -1; dy <= 1; ++dy) {
+                    int64_t mapKey = MakeSnapKey(key.first + dx, key.second + dy);
+                    auto it = endMap.find(mapKey);
+                    if (it == endMap.end()) continue;
+
+                    for (size_t idx : it->second) {
+                        if (visited[idx] || trialUsed[idx]) continue;
+                        const auto& l = lines[idx];
+                        double dS = fabs(currEnd.x - l.start.x) + fabs(currEnd.y - l.start.y);
+                        double dE = fabs(currEnd.x - l.end.x) + fabs(currEnd.y - l.end.y);
+                        if (dS < snapTol && dS < bestDist) {
+                            bestDist = dS; bestIdx = idx; bestReverse = false;
+                        }
+                        if (dE < snapTol && dE < bestDist) {
+                            bestDist = dE; bestIdx = idx; bestReverse = true;
+                        }
                     }
                 }
             }
 
             if (bestIdx == SIZE_MAX) break;
 
-            visited[bestIdx] = true;
+            trialUsed[bestIdx] = true;
+            trialIndices.push_back(bestIdx);
             if (bestReverse) {
                 OneLine rev = lines[bestIdx];
                 swap(rev.start, rev.end);
@@ -1242,6 +1530,9 @@ vector<Loop> BuildLoops(const vector<OneLine>& inputLines) {
         if (IsPointEqual(currentLoop.back().end, currentLoop.front().start, snapTol)
             && currentLoop.size() >= 3)
         {
+            for (size_t idx : trialIndices) {
+                visited[idx] = true;
+            }
             loops.push_back(currentLoop);
         }
     }
@@ -1254,6 +1545,19 @@ vector<Loop> BuildLoops(const vector<OneLine>& inputLines) {
     int usedCount = 0;
     for (bool v : visited) if (v) usedCount++;
     cout << "  输入线段: " << lines.size() << " 已用: " << usedCount << " 未用: " << lines.size() - usedCount << endl;
+    if (usedCount < (int)lines.size()) {
+        std::vector<OneLine> unusedLines;
+        for (size_t i = 0; i < lines.size(); ++i) {
+            if (!visited[i]) {
+                unusedLines.push_back(lines[i]);
+            }
+        }
+        std::string unusedName = savePath + "BuildLoops_UnusedLines_" + std::to_string((int)lines.size())
+            + "_unused_" + std::to_string((int)unusedLines.size()) + ".brep";
+        ExportOneLinesToBrep(unusedLines, unusedName);
+        cout << "  [BuildLoops] 未用线段已导出: " << unusedName << endl;
+        PrintEndpointGapDiagnostics(unusedLines, snapTol);
+    }
     cout << "==========================================\n" << endl;
 
     return loops;
@@ -1316,6 +1620,211 @@ bool IsFaceInsideFace(const Face2D& innerFace, const Face2D& outerFace) {
         }
     }
     return true; // 所有顶点都在内部
+}
+
+LoopBBox2D GetLoopBBox(const Loop& loop) {
+    LoopBBox2D box;
+    if (loop.empty()) return box;
+
+    box.xMin = box.xMax = loop.front().start.x;
+    box.yMin = box.yMax = loop.front().start.y;
+    box.valid = true;
+
+    for (const auto& line : loop) {
+        box.xMin = std::min(box.xMin, line.start.x);
+        box.xMax = std::max(box.xMax, line.start.x);
+        box.yMin = std::min(box.yMin, line.start.y);
+        box.yMax = std::max(box.yMax, line.start.y);
+
+        box.xMin = std::min(box.xMin, line.end.x);
+        box.xMax = std::max(box.xMax, line.end.x);
+        box.yMin = std::min(box.yMin, line.end.y);
+        box.yMax = std::max(box.yMax, line.end.y);
+    }
+
+    return box;
+}
+
+double BBoxDistance2D(const LoopBBox2D& a, const LoopBBox2D& b) {
+    if (!a.valid || !b.valid) return std::numeric_limits<double>::max();
+
+    double dx = 0.0;
+    if (a.xMax < b.xMin) dx = b.xMin - a.xMax;
+    else if (b.xMax < a.xMin) dx = a.xMin - b.xMax;
+
+    double dy = 0.0;
+    if (a.yMax < b.yMin) dy = b.yMin - a.yMax;
+    else if (b.yMax < a.yMin) dy = a.yMin - b.yMax;
+
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+double Cross2D(const Point3D& a, const Point3D& b, const Point3D& c) {
+    return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+}
+
+bool IsValueBetween(double value, double a, double b, double tol = 1e-9) {
+    return value >= std::min(a, b) - tol && value <= std::max(a, b) + tol;
+}
+
+bool IsPointOnSegment2D(const Point3D& p, const Point3D& a, const Point3D& b, double tol = 1e-9) {
+    return std::abs(Cross2D(a, b, p)) <= tol
+        && IsValueBetween(p.x, a.x, b.x, tol)
+        && IsValueBetween(p.y, a.y, b.y, tol);
+}
+
+bool SegmentsIntersect2D(const Point3D& a, const Point3D& b, const Point3D& c, const Point3D& d) {
+    const double tol = 1e-9;
+    double c1 = Cross2D(a, b, c);
+    double c2 = Cross2D(a, b, d);
+    double c3 = Cross2D(c, d, a);
+    double c4 = Cross2D(c, d, b);
+
+    if (((c1 > tol && c2 < -tol) || (c1 < -tol && c2 > tol)) &&
+        ((c3 > tol && c4 < -tol) || (c3 < -tol && c4 > tol))) {
+        return true;
+    }
+
+    return IsPointOnSegment2D(c, a, b, tol)
+        || IsPointOnSegment2D(d, a, b, tol)
+        || IsPointOnSegment2D(a, c, d, tol)
+        || IsPointOnSegment2D(b, c, d, tol);
+}
+
+double PointSegmentDistance2D(const Point3D& p, const Point3D& a, const Point3D& b) {
+    double vx = b.x - a.x;
+    double vy = b.y - a.y;
+    double wx = p.x - a.x;
+    double wy = p.y - a.y;
+    double lenSq = vx * vx + vy * vy;
+
+    if (lenSq < 1e-18) {
+        double dx = p.x - a.x;
+        double dy = p.y - a.y;
+        return std::sqrt(dx * dx + dy * dy);
+    }
+
+    double t = (wx * vx + wy * vy) / lenSq;
+    t = std::max(0.0, std::min(1.0, t));
+    double projX = a.x + t * vx;
+    double projY = a.y + t * vy;
+    double dx = p.x - projX;
+    double dy = p.y - projY;
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+double SegmentSegmentDistance2D(const OneLine& a, const OneLine& b) {
+    if (SegmentsIntersect2D(a.start, a.end, b.start, b.end)) {
+        return 0.0;
+    }
+
+    double d1 = PointSegmentDistance2D(a.start, b.start, b.end);
+    double d2 = PointSegmentDistance2D(a.end, b.start, b.end);
+    double d3 = PointSegmentDistance2D(b.start, a.start, a.end);
+    double d4 = PointSegmentDistance2D(b.end, a.start, a.end);
+    return std::min(std::min(d1, d2), std::min(d3, d4));
+}
+
+double LoopDistance2D(const Loop& a, const Loop& b) {
+    if (a.empty() || b.empty()) return std::numeric_limits<double>::max();
+
+    double best = std::numeric_limits<double>::max();
+    for (const auto& lineA : a) {
+        for (const auto& lineB : b) {
+            best = std::min(best, SegmentSegmentDistance2D(lineA, lineB));
+            if (best <= 1e-9) return 0.0;
+        }
+    }
+    return best;
+}
+
+std::vector<Point_2> CollectFaceOuterPoints(const std::vector<Face2D>& faces) {
+    std::vector<Point_2> points;
+    for (const auto& face : faces) {
+        for (const auto& line : face.outerLoop) {
+            points.emplace_back(line.start.x, line.start.y);
+            points.emplace_back(line.end.x, line.end.y);
+        }
+    }
+    return points;
+}
+
+Face2D ComputeMergedHullFace(
+    const std::vector<HullItem>& hullItems,
+    const std::vector<int>& memberIndices,
+    double zHeight)
+{
+    std::vector<Face2D> memberSolids;
+    for (int memberIndex : memberIndices) {
+        if (memberIndex >= 0 && memberIndex < (int)hullItems.size()) {
+            memberSolids.push_back(hullItems[memberIndex].solid);
+        }
+    }
+
+    std::vector<Point_2> points_2d = CollectFaceOuterPoints(memberSolids);
+    std::vector<Point_2> hull_points;
+    if (!points_2d.empty()) {
+        CGAL::convex_hull_2(points_2d.begin(), points_2d.end(), std::back_inserter(hull_points));
+    }
+
+    return ConvertPointsToHullFace_EK(hull_points, zHeight);
+}
+
+std::vector<HullGroup> BuildMergedHullGroups(
+    const std::vector<HullItem>& hullItems,
+    const OpenCavityFilterParams& params)
+{
+    std::vector<HullGroup> groups;
+    const int n = (int)hullItems.size();
+    if (n == 0) return groups;
+
+    UnionFind uf(n);
+    std::vector<LoopBBox2D> boxes(n);
+    for (int i = 0; i < n; ++i) {
+        boxes[i] = GetLoopBBox(hullItems[i].hull.outerLoop);
+    }
+
+    const double mergeLimit = params.hullMergeDistance;
+    const double precheckLimit = mergeLimit + params.bboxPrecheckMargin;
+
+    for (int i = 0; i < n; ++i) {
+        for (int j = i + 1; j < n; ++j) {
+            double bboxDistance = BBoxDistance2D(boxes[i], boxes[j]);
+            if (bboxDistance > precheckLimit) {
+                continue;
+            }
+
+            double hullDistance = std::numeric_limits<double>::max();
+            if (IsFaceInsideFace(hullItems[i].hull, hullItems[j].hull) ||
+                IsFaceInsideFace(hullItems[j].hull, hullItems[i].hull)) {
+                hullDistance = 0.0;
+            }
+            else {
+                hullDistance = LoopDistance2D(hullItems[i].hull.outerLoop, hullItems[j].hull.outerLoop);
+            }
+
+            if (hullDistance <= mergeLimit) {
+                uf.Unite(i, j, hullDistance);
+            }
+        }
+    }
+
+    std::map<int, HullGroup> groupedByRoot;
+    for (int i = 0; i < n; ++i) {
+        int root = uf.Find(i);
+        groupedByRoot[root].memberIndices.push_back(i);
+    }
+
+    for (auto& entry : groupedByRoot) {
+        int root = uf.Find(entry.first);
+        entry.second.triggerDistance = uf.triggerDistance[root];
+        if (entry.second.triggerDistance == std::numeric_limits<double>::max()) {
+            entry.second.triggerDistance = 0.0;
+        }
+        groups.push_back(entry.second);
+    }
+
+    return groups;
 }
 
 // 递归提取面（全空间剖分：无论奇偶层都提取为面）
@@ -1503,28 +2012,7 @@ void ExportFace2DToBrep(const std::vector<Face2D>& faces, const std::string& fil
     std::cout << "  重建的面已保存至: " << fileName << std::endl;
 }
 
-// 将纯数学线段集合保存为 BREP 文件，用于可视化验证
-void ExportOneLinesToBrep(const std::vector<OneLine>& lines, const std::string& fileName) {
-    if (lines.empty()) return;
-    
-    BRep_Builder builder;
-    TopoDS_Compound comp;
-    builder.MakeCompound(comp);
-    
-    for (const auto& line : lines) {
-        gp_Pnt p1(line.start.x, line.start.y, line.start.z);
-        gp_Pnt p2(line.end.x, line.end.y, line.end.z);
-        
-        // 防止起点和终点重合导致 MakeEdge 失败
-        if (!p1.IsEqual(p2, 1e-7)) {
-            TopoDS_Edge anEdge = BRepBuilderAPI_MakeEdge(p1, p2);
-            builder.Add(comp, anEdge);
-        }
-    }
-    
-    BRepTools::Write(comp, fileName.c_str());
-    cout << "  打散后的线段已保存至: " << fileName << endl;
-}
+
 
 //获取切分结果：切分面 + 切分线（减去凹边）
 std::vector<Face2D> SliceModelAtZ(const TopoDS_Shape& shape, double splitZ, int sliceIndex, int maxIndex, const TopTools_DataMapOfShapeInteger& faceToIdMap) {
@@ -2706,7 +3194,8 @@ std::map<int, double> BuildFilletRadiusMap(
 bool IsSmallFilletCavity(
     const Face2D& face,
     const std::map<int, double>& filletMap,
-    double maxFilletRadius)
+    double maxFilletRadius,
+    std::vector<std::pair<int, double>>* matchedFillets = nullptr)
 {
     const auto& loop = face.outerLoop;
     if (loop.empty()) return false;
@@ -2737,11 +3226,17 @@ bool IsSmallFilletCavity(
 
     if (edgeNeighborIds.empty()) return false;
 
+    std::vector<std::pair<int, double>> localMatchedFillets;
     for (int fid : edgeNeighborIds) {
         auto it = filletMap.find(fid);
         if (it == filletMap.end() || it->second <= 0 || it->second >= maxFilletRadius) {
             return false;
         }
+        localMatchedFillets.push_back({ fid, it->second });
+    }
+
+    if (matchedFillets) {
+        *matchedFillets = localMatchedFillets;
     }
     return true;
 }
@@ -2788,8 +3283,14 @@ std::vector<Face2D> CleanAndFilterOpenCavities(
             continue;
         }
 
-        if (IsSmallFilletCavity(face, filletMap, params.maxFilletRadius)) {
+        std::vector<std::pair<int, double>> matchedFillets;
+        if (IsSmallFilletCavity(face, filletMap, params.maxFilletRadius, &matchedFillets)) {
             std::cout << "  ❌ 型腔#" << idx << " 被过滤: 小圆角特征 (半径 < " << params.maxFilletRadius << ")" << std::endl;
+            std::cout << "      圆角面: ";
+            for (const auto& [fid, radius] : matchedFillets) {
+                std::cout << "faceId=" << fid << " radius=" << radius << " ";
+            }
+            std::cout << std::endl;
             continue;
         }
 
@@ -3606,36 +4107,56 @@ std::pair<TopoDS_Compound, TopoDS_Compound> SplitCompoundAtZ(
     for (int id : facesToSplit) {
         TopoDS_Face faceToCut = TopoDS::Face(idToFace.Find(id));
 
-        BRepAlgoAPI_Section section(faceToCut, planeFace);
-        section.Build();
+        try {
+            BRepAlgoAPI_Section section(faceToCut, planeFace);
+            section.Build();
 
-        if (!section.IsDone() || !TopExp_Explorer(section.Shape(), TopAbs_EDGE).More()) {
-            belowIds.insert(id);
-            continue;
-        }
-
-        BRepFeat_SplitShape splitter(faceToCut);
-        TopExp_Explorer edgeExp(section.Shape(), TopAbs_EDGE);
-        for (; edgeExp.More(); edgeExp.Next()) {
-            splitter.Add(TopoDS::Edge(edgeExp.Current()), faceToCut);
-        }
-        splitter.Build();
-
-        if (splitter.IsDone()) {
-            TopExp_Explorer faceExp(splitter.Shape(), TopAbs_FACE);
-            for (; faceExp.More(); faceExp.Next()) {
-                TopoDS_Face subFace = TopoDS::Face(faceExp.Current());
-                double smin, smax;
-                GetFaceZRange(subFace, smin, smax);
-                double zMid = (smin + smax) / 2.0;
-
-                int newId = nextId++;
-                idToFace.Bind(newId, subFace);
-
-                if (zMid > splitZ) aboveIds.insert(newId);
-                else belowIds.insert(newId);
+            if (!section.IsDone() || !TopExp_Explorer(section.Shape(), TopAbs_EDGE).More()) {
+                belowIds.insert(id);
+                continue;
             }
-        } else {
+
+            BRepFeat_SplitShape splitter(faceToCut);
+            TopExp_Explorer edgeExp(section.Shape(), TopAbs_EDGE);
+            for (; edgeExp.More(); edgeExp.Next()) {
+                splitter.Add(TopoDS::Edge(edgeExp.Current()), faceToCut);
+            }
+            splitter.Build();
+
+            if (splitter.IsDone()) {
+                TopExp_Explorer faceExp(splitter.Shape(), TopAbs_FACE);
+                bool producedSubFace = false;
+                for (; faceExp.More(); faceExp.Next()) {
+                    TopoDS_Face subFace = TopoDS::Face(faceExp.Current());
+                    double smin, smax;
+                    GetFaceZRange(subFace, smin, smax);
+                    double zMid = (smin + smax) / 2.0;
+
+                    int newId = nextId++;
+                    idToFace.Bind(newId, subFace);
+                    producedSubFace = true;
+
+                    if (zMid > splitZ) aboveIds.insert(newId);
+                    else belowIds.insert(newId);
+                }
+                if (!producedSubFace) {
+                    belowIds.insert(id);
+                }
+            } else {
+                belowIds.insert(id);
+            }
+        }
+        catch (const Standard_Failure& e) {
+            std::cerr << "  [SplitCompoundAtZ] Z=" << splitZ
+                << " 切分面ID=" << id
+                << " OCCT异常: " << e.GetMessageString()
+                << "，保留到下方" << std::endl;
+            belowIds.insert(id);
+        }
+        catch (...) {
+            std::cerr << "  [SplitCompoundAtZ] Z=" << splitZ
+                << " 切分面ID=" << id
+                << " 未知异常，保留到下方" << std::endl;
             belowIds.insert(id);
         }
     }
@@ -3650,16 +4171,36 @@ std::pair<TopoDS_Compound, TopoDS_Compound> SplitCompoundAtZ(
     return { upper, lower };
 }
 
+int CountFacesInCompound(const TopoDS_Compound& compound);
+
 std::vector<TopoDS_Compound> RecursiveSplitCavity(const TopoDS_Compound& cavity) {
     std::vector<TopoDS_Compound> result;
+
+    int inputFaceCount = CountFacesInCompound(cavity);
+    if (inputFaceCount == 0) {
+        std::cout << "  [递推切割] 收到空型腔，跳过。" << std::endl;
+        return result;
+    }
 
     TopTools_IndexedDataMapOfShapeListOfShape edgeToFaces;
     TopExp::MapShapesAndAncestors(cavity, TopAbs_EDGE, TopAbs_FACE, edgeToFaces);
 
     Bnd_Box cavityBox;
     BRepBndLib::Add(cavity, cavityBox);
+    if (cavityBox.IsVoid()) {
+        std::cout << "  [递推切割] 型腔包围盒为空，跳过。faces=" << inputFaceCount << std::endl;
+        return result;
+    }
+
     double xmin, ymin, zmin, xmax, ymax, topZ;
-    cavityBox.Get(xmin, ymin, zmin, xmax, ymax, topZ);
+    try {
+        cavityBox.Get(xmin, ymin, zmin, xmax, ymax, topZ);
+    }
+    catch (const Standard_Failure& e) {
+        std::cerr << "  [递推切割] Bnd_Box::Get异常: " << e.GetMessageString()
+            << " faces=" << inputFaceCount << std::endl;
+        return result;
+    }
 
     std::set<double> zSet;
     TopExp_Explorer exp(cavity, TopAbs_FACE);
@@ -3705,13 +4246,25 @@ std::vector<TopoDS_Compound> RecursiveSplitCavity(const TopoDS_Compound& cavity)
     std::cout << "  [递推切割] Z = " << splitZ << std::endl;
 
     auto [upper, lower] = SplitCompoundAtZ(cavity, splitZ);
-    result.push_back(upper);
+    int upperFaces = CountFacesInCompound(upper);
+    int lowerFaces = CountFacesInCompound(lower);
+    std::cout << "  [递推切割] 切后 upperFaces=" << upperFaces
+        << " lowerFaces=" << lowerFaces << std::endl;
+
+    if (upperFaces > 0) {
+        result.push_back(upper);
+    }
+
+    if (lowerFaces == 0) {
+        return result;
+    }
 
     std::vector<TopoDS_Compound> lowerParts = SeparateDisconnectedCavities(lower);
     std::cout << "  [连通性] 下方拆分为 " << lowerParts.size() << " 个独立部分" << std::endl;
 
     if (lowerParts.size() > 1) {
         for (const auto& part : lowerParts) {
+            if (CountFacesInCompound(part) == 0) continue;
             auto subResult = RecursiveSplitCavity(part);
             result.insert(result.end(), subResult.begin(), subResult.end());
         }
@@ -3721,6 +4274,393 @@ std::vector<TopoDS_Compound> RecursiveSplitCavity(const TopoDS_Compound& cavity)
     }
 
     return result;
+}
+
+double CalculateFaceAreaOCC(const TopoDS_Face& face) {
+    GProp_GProps props;
+    BRepGProp::SurfaceProperties(face, props);
+    return props.Mass();
+}
+
+int CountFacesInCompound(const TopoDS_Compound& compound) {
+    int count = 0;
+    TopExp_Explorer exp(compound, TopAbs_FACE);
+    for (; exp.More(); exp.Next()) {
+        count++;
+    }
+    return count;
+}
+
+std::vector<double> MergeCloseSplitZs(std::vector<double> splitZs, double minGap) {
+    if (splitZs.empty()) return splitZs;
+
+    std::sort(splitZs.begin(), splitZs.end(), std::greater<double>());
+    std::vector<double> merged;
+    for (double z : splitZs) {
+        if (merged.empty() || std::abs(merged.back() - z) >= minGap) {
+            merged.push_back(z);
+        }
+    }
+    return merged;
+}
+
+std::vector<double> CollectOpenCavitySplitZs(
+    const TopoDS_Compound& cavity,
+    const CavityFeature& feature,
+    const OpenCavitySplitParams& params)
+{
+    std::vector<double> splitZs;
+
+    TopTools_IndexedDataMapOfShapeListOfShape edgeToFaces;
+    TopExp::MapShapesAndAncestors(cavity, TopAbs_EDGE, TopAbs_FACE, edgeToFaces);
+
+    TopExp_Explorer exp(cavity, TopAbs_FACE);
+    for (; exp.More(); exp.Next()) {
+        TopoDS_Face face = TopoDS::Face(exp.Current());
+        if (!IsHorizontalFace(face)) continue;
+
+        double zFace = GetHorizontalFaceZ(face);
+        if (zFace >= feature.topZ - params.zProtectionTol ||
+            zFace <= feature.bottomZ + params.zProtectionTol) {
+            std::cout << "  [开放切分候选] Z=" << zFace << " 被跳过: 顶/底保护区" << std::endl;
+            continue;
+        }
+
+        double area = CalculateFaceAreaOCC(face);
+        if (area < params.minStepFaceArea) {
+            std::cout << "  [开放切分候选] Z=" << zFace << " 被跳过: 面积过小 area=" << area << std::endl;
+            continue;
+        }
+
+        bool hasUpNeighbor = false;
+        bool hasDownNeighbor = false;
+
+        TopExp_Explorer edgeExp(face, TopAbs_EDGE);
+        for (; edgeExp.More(); edgeExp.Next()) {
+            const TopoDS_Edge& edge = TopoDS::Edge(edgeExp.Current());
+            if (!edgeToFaces.Contains(edge)) continue;
+
+            const TopTools_ListOfShape& neighbors = edgeToFaces.FindFromKey(edge);
+            TopTools_ListIteratorOfListOfShape it(neighbors);
+            for (; it.More(); it.Next()) {
+                TopoDS_Face neighbor = TopoDS::Face(it.Value());
+                if (neighbor.IsSame(face)) continue;
+
+                double nZmin, nZmax;
+                GetFaceZRange(neighbor, nZmin, nZmax);
+                if (nZmax > zFace + params.neighborZTol) {
+                    hasUpNeighbor = true;
+                }
+                if (nZmin < zFace - params.neighborZTol) {
+                    hasDownNeighbor = true;
+                }
+            }
+        }
+
+        bool isMiddleStep = hasUpNeighbor && hasDownNeighbor;
+        bool isDownOnlyStep = params.splitDownOnlyStepFaces && hasDownNeighbor && !hasUpNeighbor;
+
+        if (!isMiddleStep && !isDownOnlyStep) {
+            std::cout << "  [开放切分候选] Z=" << zFace << " 被跳过: 缺少上下连续邻接"
+                << " up=" << hasUpNeighbor << " down=" << hasDownNeighbor
+                << " area=" << area << std::endl;
+            continue;
+        }
+
+        std::cout << "  [开放切分候选] Z=" << zFace << " 被采用: "
+            << (isDownOnlyStep ? "仅下方邻接凸台/岛顶面" : "上下连续台阶")
+            << " area=" << area << std::endl;
+        splitZs.push_back(zFace);
+    }
+
+    return MergeCloseSplitZs(splitZs, params.minSplitGap);
+}
+
+bool GetCompoundZRangeSafe(const TopoDS_Compound& compound, double& zmin, double& zmax) {
+    Bnd_Box box;
+    BRepBndLib::Add(compound, box);
+    if (box.IsVoid()) return false;
+
+    double xmin, ymin, xmax, ymax;
+    try {
+        box.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+    }
+    catch (...) {
+        return false;
+    }
+    return true;
+}
+
+std::vector<double> CollectOpenCavitySplitZsForPart(
+    const TopoDS_Compound& part,
+    const CavityFeature& feature,
+    const OpenCavitySplitParams& params,
+    const std::string& branchName)
+{
+    double localZmin = 0.0;
+    double localZmax = 0.0;
+    if (!GetCompoundZRangeSafe(part, localZmin, localZmax)) {
+        return {};
+    }
+
+    std::vector<double> raw = CollectOpenCavitySplitZs(part, feature, params);
+    std::vector<double> local;
+    for (double z : raw) {
+        if (z >= localZmax - params.zProtectionTol ||
+            z <= localZmin + params.zProtectionTol) {
+            std::cout << "  [开放Z切分] branch=" << branchName
+                << " 跳过局部顶/底切分点 Z=" << z
+                << " localZ=[" << localZmin << "," << localZmax << "]" << std::endl;
+            continue;
+        }
+        local.push_back(z);
+    }
+
+    local = MergeCloseSplitZs(local, params.minSplitGap);
+    std::cout << "  [开放Z切分] branch=" << branchName
+        << " localZ=[" << localZmin << "," << localZmax << "]"
+        << " 局部候选数量=" << local.size() << ": ";
+    for (double z : local) std::cout << z << " ";
+    std::cout << std::endl;
+    return local;
+}
+
+std::vector<TopoDS_Compound> MergeGeometricallyConnectedOpenParts(
+    const std::vector<TopoDS_Compound>& rawParts,
+    double tolerance,
+    int featureId,
+    const std::string& branchName,
+    int depth,
+    bool exportDebugBreps)
+{
+    if (rawParts.size() <= 1) return rawParts;
+
+    UnionFind uf((int)rawParts.size());
+
+    for (size_t i = 0; i < rawParts.size(); ++i) {
+        for (size_t j = i + 1; j < rawParts.size(); ++j) {
+            BRepExtrema_DistShapeShape distCalc(rawParts[i], rawParts[j]);
+            if (!distCalc.IsDone()) {
+                std::cout << "  [开放几何连通] feature=" << featureId
+                    << " branch=" << branchName
+                    << " depth=" << depth
+                    << " part " << i << "-" << j
+                    << " 距离计算失败" << std::endl;
+                continue;
+            }
+
+            double distance = distCalc.Value();
+            if (distance <= tolerance) {
+                std::cout << "  [开放几何连通] feature=" << featureId
+                    << " branch=" << branchName
+                    << " depth=" << depth
+                    << " 合并 part " << i << " + " << j
+                    << " distance=" << distance
+                    << " tol=" << tolerance << std::endl;
+                uf.Unite((int)i, (int)j, distance);
+            }
+        }
+    }
+
+    std::map<int, std::vector<int>> groups;
+    for (int i = 0; i < (int)rawParts.size(); ++i) {
+        groups[uf.Find(i)].push_back(i);
+    }
+
+    std::vector<TopoDS_Compound> mergedParts;
+    BRep_Builder builder;
+    int mergedIndex = 0;
+    for (const auto& entry : groups) {
+        TopoDS_Compound merged;
+        builder.MakeCompound(merged);
+
+        for (int idx : entry.second) {
+            TopExp_Explorer exp(rawParts[idx], TopAbs_FACE);
+            for (; exp.More(); exp.Next()) {
+                builder.Add(merged, exp.Current());
+            }
+        }
+
+        if (CountFacesInCompound(merged) > 0) {
+            if (exportDebugBreps) {
+                std::string mergedPath = savePath + "OpenSplit_Feature_" + std::to_string(featureId)
+                    + "_Branch_" + branchName
+                    + "_Depth_" + std::to_string(depth)
+                    + "_MergedLowerPart_" + std::to_string(mergedIndex)
+                    + "_Members_" + std::to_string((int)entry.second.size()) + ".brep";
+                BRepTools::Write(merged, mergedPath.c_str());
+            }
+            mergedParts.push_back(merged);
+            mergedIndex++;
+        }
+    }
+
+    std::cout << "  [开放几何连通] feature=" << featureId
+        << " branch=" << branchName
+        << " depth=" << depth
+        << " rawParts=" << rawParts.size()
+        << " mergedParts=" << mergedParts.size() << std::endl;
+
+    return mergedParts;
+}
+
+std::vector<TopoDS_Compound> SplitOpenCavityByZPlan(
+    const TopoDS_Compound& cavity,
+    const CavityFeature& feature,
+    const OpenCavitySplitParams& params,
+    int featureId)
+{
+    std::vector<TopoDS_Compound> result;
+
+    struct OpenSplitTask {
+        TopoDS_Compound shape;
+        int depth = 0;
+        std::string branchName;
+    };
+
+    std::vector<OpenSplitTask> tasks;
+    tasks.push_back({ cavity, 0, "root" });
+
+    while (!tasks.empty()) {
+        OpenSplitTask task = tasks.back();
+        tasks.pop_back();
+
+        int taskFaces = CountFacesInCompound(task.shape);
+        if (taskFaces == 0) {
+            continue;
+        }
+
+        if (task.depth >= params.maxRecursionDepth) {
+            std::cout << "  [开放Z切分] branch=" << task.branchName
+                << " 达到最大递归深度，作为最终特征保留。" << std::endl;
+            result.push_back(task.shape);
+            continue;
+        }
+
+        std::vector<double> localSplitZs =
+            CollectOpenCavitySplitZsForPart(task.shape, feature, params, task.branchName);
+
+        if (localSplitZs.empty()) {
+            result.push_back(task.shape);
+            continue;
+        }
+
+        double splitZ = localSplitZs.front();
+        auto [upper, lower] = SplitCompoundAtZ(task.shape, splitZ);
+
+        int upperFaces = CountFacesInCompound(upper);
+        int lowerFaces = CountFacesInCompound(lower);
+        std::cout << "  [开放Z切分] feature=" << featureId
+            << " branch=" << task.branchName
+            << " depth=" << task.depth
+            << " Z=" << splitZ
+            << " localCandidates=" << localSplitZs.size()
+            << " inputFaces=" << taskFaces
+            << " upperFaces=" << upperFaces
+            << " lowerFaces=" << lowerFaces << std::endl;
+
+        if (upperFaces == 0 || lowerFaces == 0) {
+            std::cout << "  [开放Z切分] branch=" << task.branchName
+                << " 切分未产生有效上下层，作为最终特征保留，避免重复递推。" << std::endl;
+            result.push_back(task.shape);
+            continue;
+        }
+
+        if (params.exportDebugBreps) {
+            std::string upperPath = savePath + "OpenSplit_Feature_" + std::to_string(featureId)
+                + "_Branch_" + task.branchName
+                + "_Depth_" + std::to_string(task.depth) + "_Upper_Z" + std::to_string(splitZ) + ".brep";
+            std::string lowerPath = savePath + "OpenSplit_Feature_" + std::to_string(featureId)
+                + "_Branch_" + task.branchName
+                + "_Depth_" + std::to_string(task.depth) + "_Lower_Z" + std::to_string(splitZ) + ".brep";
+            BRepTools::Write(upper, upperPath.c_str());
+            BRepTools::Write(lower, lowerPath.c_str());
+        }
+
+        if (upperFaces > 0) {
+            result.push_back(upper);
+        }
+
+        if (lowerFaces == 0) {
+            continue;
+        }
+
+        std::vector<TopoDS_Compound> rawLowerParts = SeparateDisconnectedCavities(lower);
+        std::cout << "  [开放Z切分连通性] feature=" << featureId
+            << " branch=" << task.branchName
+            << " depth=" << task.depth
+            << " rawParts=" << rawLowerParts.size() << std::endl;
+
+        if (params.exportDebugBreps) {
+            for (size_t p = 0; p < rawLowerParts.size(); ++p) {
+                std::string rawPath = savePath + "OpenSplit_Feature_" + std::to_string(featureId)
+                    + "_Branch_" + task.branchName
+                    + "_Depth_" + std::to_string(task.depth)
+                    + "_RawLowerPart_" + std::to_string(p) + ".brep";
+                BRepTools::Write(rawLowerParts[p], rawPath.c_str());
+            }
+        }
+
+        if (rawLowerParts.empty()) {
+            tasks.push_back({ lower, task.depth + 1, task.branchName + "_L" });
+            continue;
+        }
+
+        std::vector<TopoDS_Compound> lowerParts = MergeGeometricallyConnectedOpenParts(
+            rawLowerParts,
+            params.geometricConnectTol,
+            featureId,
+            task.branchName,
+            task.depth,
+            params.exportDebugBreps);
+
+        if (lowerParts.empty()) {
+            tasks.push_back({ lower, task.depth + 1, task.branchName + "_L" });
+            continue;
+        }
+
+        for (size_t p = 0; p < lowerParts.size(); ++p) {
+            int partFaces = CountFacesInCompound(lowerParts[p]);
+            if (partFaces == 0) continue;
+
+            std::string childBranch = task.branchName + "_L" + std::to_string(p);
+            if (params.exportDebugBreps) {
+                std::string partPath = savePath + "OpenSplit_Feature_" + std::to_string(featureId)
+                    + "_Branch_" + childBranch
+                    + "_AfterDepth_" + std::to_string(task.depth)
+                    + "_LowerPart.brep";
+                BRepTools::Write(lowerParts[p], partPath.c_str());
+            }
+
+            tasks.push_back({ lowerParts[p], task.depth + 1, childBranch });
+        }
+    }
+
+    if (result.empty() && CountFacesInCompound(cavity) > 0) {
+        result.push_back(cavity);
+    }
+
+    return result;
+}
+
+std::vector<TopoDS_Compound> SplitOpenCavityConservatively(
+    const TopoDS_Compound& cavity,
+    const CavityFeature& feature,
+    const OpenCavitySplitParams& params)
+{
+    std::vector<double> splitZs = CollectOpenCavitySplitZs(cavity, feature, params);
+    std::cout << "  [开放Z切分] feature=" << feature.featureId
+        << " 候选切分点数量=" << splitZs.size() << ": ";
+    for (double z : splitZs) {
+        std::cout << z << " ";
+    }
+    std::cout << std::endl;
+
+    if (splitZs.empty()) {
+        return { cavity };
+    }
+
+    return SplitOpenCavityByZPlan(cavity, feature, params, feature.featureId);
 }
 
 /**
@@ -3779,11 +4719,13 @@ void ProcessAndSplitOpenCavityFeatures(
     // 5. 沿 Z 轴自适应多级物理切割
     int totalPartCount = 0;
     std::vector<CavityFeature> finalMachinableOpenFeatures;
+    OpenCavitySplitParams openSplitParams;
 
     for (size_t i = 0; i < trueOpenCavities.size(); ++i) {
 
-        // 获取当前父型腔沿 Z 轴递推切分后的所有层
-        std::vector<TopoDS_Compound> zLayers = RecursiveSplitCavity(trueOpenCavities[i]);
+        // 获取当前父型腔沿 Z 轴保守切分后的所有层
+        std::vector<TopoDS_Compound> zLayers =
+            SplitOpenCavityConservatively(trueOpenCavities[i], cavityFeatures[i], openSplitParams);
 
         for (size_t j = 0; j < zLayers.size(); ++j) {
 
@@ -3804,9 +4746,14 @@ void ProcessAndSplitOpenCavityFeatures(
             BRepTools::Write(sewedCompound, fileName.c_str());
 
 
-            // 🎯 【连通性检测与孤岛修复】
-            std::vector<TopoDS_Compound> rawSubParts = SeparateDisconnectedCavities(sewedCompound);
-            std::vector<TopoDS_Compound> isolatedSubParts = MergeNestedIslands(rawSubParts);
+            std::vector<TopoDS_Compound> isolatedSubParts;
+
+            // 开放型腔的同一Z层可能在拓扑上断开，但加工语义上仍属于同一特征。
+            isolatedSubParts.push_back(sewedCompound);
+            std::cout << "  [开放层保持合并] feature=" << cavityFeatures[i].featureId
+                << " layer=" << j
+                << " faces=" << CountFacesInCompound(sewedCompound) << std::endl;
+        
 
             std::vector<CavityFeature> converted = ConvertPartsToFeatures(isolatedSubParts, cavityFeatures[i], faceToIdMap);
            
@@ -3918,7 +4865,7 @@ std::vector<TopoDS_Compound> ProcessAndSplitClosedCavityFeatures(
 
 #if 1
 int main() {
-    std::string stepfile = "3_stp_stp.stp";
+    std::string stepfile = "8_stp_stp.stp";
 
     STEPControl_Reader reader;
     std::string inputFileName = inputPath + stepfile;
@@ -3945,76 +4892,14 @@ int main() {
     std::map<int, double> filletMap = BuildFilletRadiusMap(mainShape, faceToIdMap);
     cout << "已建立圆角半径映射，共 " << filletMap.size() << " 个面。" << endl;
 
+    OpenCavityFilterParams openCavityParams;
+
     std::vector<double> splitPoints = GetSplitPointsAlongZ(mainShape);
     
     cout << "检测到 " << splitPoints.size() << " 个切分点:" << endl;
     for (int i = 0; i < splitPoints.size(); i++) {
         cout << "  [" << i << "] Z = " << splitPoints[i] << endl;
     }
-
-    //// ================= 新增：建立最大毛坯包围体并切分 =================
-    //cout << "\n=== 建立最大毛坯包围体并分层切割 ===" << endl;
-    //Bnd_Box totalBox;
-    //BRepBndLib::Add(mainShape, totalBox);
-    //if (!totalBox.IsVoid()) {
-    //    double xMin, yMin, zMin, xMax, yMax, zMax;
-    //    totalBox.Get(xMin, yMin, zMin, xMax, yMax, zMax);
-
-    //    // 给 X/Y 方向增加一点加工余量 (可选，这里默认为 0)
-    //    double offset = 2.0;
-    //    xMin -= offset; yMin -= offset;
-    //    xMax += offset; yMax += offset;
-
-    //    // 创建长方体毛坯
-    //    TopoDS_Shape stockShape = BRepPrimAPI_MakeBox(gp_Pnt(xMin, yMin, zMin), gp_Pnt(xMax, yMax, zMax)).Shape();
-    //    std::string StockFileName = savePath + "Stock_Body.brep";
-    //    BRepTools::Write(stockShape, StockFileName.c_str());
-    //    cout << "  已生成整体毛坯实体: Stock_Body.brep" << endl;
-
-    //    // 对毛坯进行分层切割
-    //    for (int i = (int)splitPoints.size() - 1; i >= 0; i--) {
-    //        double splitZ = splitPoints[i];
-    //        int reversedIndex = splitPoints.size() - 1 - i;
-    //        
-    //        gp_Pln cuttingPlane(gp_Pnt(0, 0, splitZ), gp_Dir(0, 0, 1));
-    //        TopoDS_Face algoPlane = BRepBuilderAPI_MakeFace(cuttingPlane);
-
-    //        BRepAlgoAPI_Section section(stockShape, algoPlane, Standard_True);
-    //        section.Build();
-
-    //        std::vector<OneLine> stockLines;
-    //        if (section.IsDone()) {
-    //            TopExp_Explorer expEdge(section.Shape(), TopAbs_EDGE);
-    //            for (; expEdge.More(); expEdge.Next()) {
-    //                TopoDS_Edge E = TopoDS::Edge(expEdge.Current());
-    //                BRepAdaptor_Curve bac(E);
-    //                GCPnts_QuasiUniformDeflection discretizer(bac, 0.01);
-    //                if (discretizer.IsDone()) {
-    //                    for (int k = 1; k < discretizer.NbPoints(); ++k) {
-    //                        gp_Pnt p1 = discretizer.Value(k);
-    //                        gp_Pnt p2 = discretizer.Value(k + 1);
-    //                        OneLine line;
-    //                        line.start.x = p1.X(); line.start.y = p1.Y(); line.start.z = p1.Z();
-    //                        line.end.x = p2.X();   line.end.y = p2.Y();   line.end.z = p2.Z();
-    //                        line.faceId = -888; 
-    //                        stockLines.push_back(line);
-    //                    }
-    //                }
-    //            }
-    //        }
-
-    //        std::vector<Face2D> stockFaces = BuildTopologyAndExtractFaces(stockLines);
-    //        std::vector<Face2D> stockSolids;
-    //        for (const auto& f : stockFaces) {
-    //            if (f.type == FaceType::SOLID) stockSolids.push_back(f);
-    //        }
-
-    //        std::string stockName = savePath + "Stock_Slice_" + std::to_string(reversedIndex) + ".brep";
-    //        ExportFace2DToBrep(stockSolids, stockName);
-    //    }
-    //    cout << "  毛坯分层切割完成！" << endl;
-    //}
-    //// =================================================================
 
     cout << "\n开始逐层切分模型 (从上往下)..." << endl;
     
@@ -4028,7 +4913,7 @@ int main() {
         int reversedIndex = splitPoints.size() - 1 - i;
         cout << "\n切分 (倒序 #" << reversedIndex << "/" << splitPoints.size() << ") (Z = " << splitZ << ")" << endl;
         
-        if (1)
+        if ( 2)
         {
             // 提取本层的面（包含 SOLID + CAVITY）
             std::vector<Face2D> currentLayerFaces = SliceModelAtZ(mainShape, splitZ, i, splitPoints.size()-1, faceToIdMap);
@@ -4063,42 +4948,56 @@ int main() {
                 }
             }
 
-			// 分离出开口型腔区域
-            // 新方案：找出最外层的凸包（不被其他凸包包围的凸包）
-            // 只对最外层的凸包进行布尔运算，小凸包的结果自然包含在大凸包中
-            std::vector<Face2D> outerHulls;
-            for (const auto& hullFace : currentConvexHullFaces) {
-                bool isInsideOtherHull = false;
-                for (const auto& otherHull : currentConvexHullFaces) {
-                    if (&otherHull == &hullFace) continue; // 跳过自身
-                    if (IsFaceInsideFace(hullFace, otherHull)) {
-                        isInsideOtherHull = true;
-                        break;
+            std::vector<HullItem> hullItems;
+            for (size_t h = 0; h < currentConvexHullFaces.size() && h < currentSolidFaces.size(); ++h) {
+                HullItem item;
+                item.hull = currentConvexHullFaces[h];
+                item.solid = currentSolidFaces[h];
+                item.index = (int)h;
+                hullItems.push_back(item);
+            }
+
+            std::vector<HullGroup> mergedHullGroups = BuildMergedHullGroups(hullItems, openCavityParams);
+            std::vector<Face2D> currentMergedHullFaces;
+
+            cout << "  [开放型腔凸包合并] 原始凸包数量: " << currentConvexHullFaces.size()
+                << " -> 合并后大凸包数量: " << mergedHullGroups.size()
+                << " (阈值=" << openCavityParams.hullMergeDistance << "mm)" << endl;
+
+            std::vector<Face2D> pocketResults;
+
+            for (size_t groupIdx = 0; groupIdx < mergedHullGroups.size(); ++groupIdx) {
+                const HullGroup& group = mergedHullGroups[groupIdx];
+                Face2D mergedHullFace = ComputeMergedHullFace(hullItems, group.memberIndices, splitZ);
+                if (mergedHullFace.outerLoop.empty()) {
+                    continue;
+                }
+                currentMergedHullFaces.push_back(mergedHullFace);
+
+                cout << "    - 大凸包组[" << groupIdx << "] 成员数: " << group.memberIndices.size()
+                    << " 触发距离: " << group.triggerDistance << endl;
+
+                std::vector<Face2D> solidsInsideHull;
+                for (int memberIndex : group.memberIndices) {
+                    if (memberIndex >= 0 && memberIndex < (int)hullItems.size()) {
+                        solidsInsideHull.push_back(hullItems[memberIndex].solid);
                     }
                 }
-                // 只有不被其他凸包包围的才是最外层凸包
-                if (!isInsideOtherHull) {
-                    outerHulls.push_back(hullFace);
-                }
-            }
-            
-            std::vector<Face2D> pocketResults;
-            
-            for (const auto& hullFace : outerHulls) {
-                // 找出在当前凸包内部的所有实体面
-                std::vector<Face2D> solidsInsideHull;
-                for (const auto& solidFace : currentSolidFaces) {
-                    solidsInsideHull.push_back(solidFace);
-                }
-                
-                // 找出在当前凸包内部的所有空腔面
+
                 std::vector<Face2D> cavitiesInsideHull;
                 for (const auto& cavityFace : currentCavityFaces) {
-                    cavitiesInsideHull.push_back(cavityFace);
+                    bool shouldSubtract = IsFaceInsideFace(cavityFace, mergedHullFace);
+                    if (!shouldSubtract) {
+                        std::vector<Face2D> intersection =
+                            BooleanFacesSingle(cavityFace, mergedHullFace, ClipType::Intersection, splitZ);
+                        shouldSubtract = !intersection.empty();
+                    }
+                    if (shouldSubtract) {
+                        cavitiesInsideHull.push_back(cavityFace);
+                    }
                 }
-                
-                // 用当前凸包依次减去它内部的实体面
-                std::vector<Face2D> hullResult = { hullFace };
+
+                std::vector<Face2D> hullResult = { mergedHullFace };
                 for (const auto& solidFace : solidsInsideHull) {
                     std::vector<Face2D> newResult;
                     for (const auto& resultFace : hullResult) {
@@ -4107,8 +5006,7 @@ int main() {
                     }
                     hullResult = newResult;
                 }
-                
-                // 继续减去它内部的空腔面
+
                 for (const auto& cavityFace : cavitiesInsideHull) {
                     std::vector<Face2D> newResult;
                     for (const auto& resultFace : hullResult) {
@@ -4117,8 +5015,7 @@ int main() {
                     }
                     hullResult = newResult;
                 }
-                
-                // 合并当前凸包的处理结果
+
                 pocketResults.insert(pocketResults.end(), hullResult.begin(), hullResult.end());
             }
             
@@ -4131,7 +5028,7 @@ int main() {
             std::string softEdgesName = savePath + "Slice_" + std::to_string(i) + "_ONLY_SoftEdges_Z" + std::to_string(splitZ) + ".brep";
             ExportSoftEdgesToBrep(tempOpenCavityFaces, softEdgesName);
 
-            vector<Face2D> currentOpenCavityFaces = CleanAndFilterOpenCavities(tempOpenCavityFaces, filletMap);
+            vector<Face2D> currentOpenCavityFaces = CleanAndFilterOpenCavities(tempOpenCavityFaces, filletMap, openCavityParams);
 
             //debug 
             for(auto& f : currentOpenCavityFaces) {
@@ -4149,8 +5046,15 @@ int main() {
 			//DEBUG: 导出当前层的实体面和腔面，检查切分结果
             std::string currentLayerFacesName = savePath + "Slice_" + std::to_string(i) + "currentLayerFaces.brep";
             ExportFace2DToBrep(currentLayerFaces, currentLayerFacesName);
-            std::string currentHullFaceName = savePath + "Slice_" + std::to_string(i) + "currentHullFace.brep";
-            ExportFace2DToBrep(currentConvexHullFaces, currentHullFaceName);
+            std::string currentSmallHullFaceName = savePath + "Slice_" + std::to_string(i) + "_IndependentSmallHulls_Z" + std::to_string(splitZ) + ".brep";
+            ExportFace2DToBrep(currentConvexHullFaces, currentSmallHullFaceName);
+            std::cout << "  [DEBUG] 本层独立小凸包已保存: " << currentSmallHullFaceName
+                << " 数量=" << currentConvexHullFaces.size() << std::endl;
+
+            std::string currentMergedHullFaceName = savePath + "Slice_" + std::to_string(i) + "_MergedBigHulls_Z" + std::to_string(splitZ) + ".brep";
+            ExportFace2DToBrep(currentMergedHullFaces, currentMergedHullFaceName);
+            std::cout << "  [DEBUG] 本层合并大凸包已保存: " << currentMergedHullFaceName
+                << " 数量=" << currentMergedHullFaces.size() << std::endl;
             std::string currentSolidFaceName = savePath + "Slice_" + std::to_string(i) + "currentSolidFace.brep";
             ExportFace2DToBrep(currentSolidFaces, currentSolidFaceName);
             std::string currentCavityFaceName = savePath + "Slice_" + std::to_string(i) + "currentCavityFacee.brep";
