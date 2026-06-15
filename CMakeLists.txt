@@ -23,9 +23,10 @@ include_directories("${OCC_BASE_DIR}/inc")
 include_directories("E:/soft/CGAL/CGAL-5.6.2/auxiliary/gmp/include")
 
 # 5. 添加可执行程序
-add_executable(CgalApp 
+add_executable(CgalApp
 	main.cpp
- 	FileName.cpp
+	cavrity_mfr.cpp
+	cavrity_mfr.h
 	clipper.engine.cpp
 	clipper.offset.cpp
 	clipper.rectclip.cpp

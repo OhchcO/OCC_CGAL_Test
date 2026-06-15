@@ -1,146 +1,296 @@
-// 1. 屏蔽 Windows 的 min/max 干扰
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
+﻿#include "cavrity_mfr.h"
 
-// 2. 先包含标准库，奠定基础环境
-#include <iostream>
-#include <vector>
-#include <mutex>
-#include <string>
-
-// 3. 包含 CGAL 头文件（趁环境还干净，先让 CGAL 解析完）
-#include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
-#include <CGAL/Polyhedron_3.h>
-#include <CGAL/convex_hull_3.h>
-
-// 4. [核心技巧] 定义 OCC 宏保护，防止其 Handle 干扰全局
-// 有时候需要暂时取消某些宏定义，但在包含 OCC 前通常不需要。
-// 包含 OCC 核心头文件
-#include <Standard_Handle.hxx> // 先单独引入 OCC 的句柄系统
-#include <STEPControl_Reader.hxx>
-#include <TopoDS_Shape.hxx>
-#include <TopoDS.hxx>
-#include <BRepMesh_IncrementalMesh.hxx>
-#include <TopExp_Explorer.hxx>
-#include <TopoDS_Face.hxx>
-#include <BRep_Tool.hxx>
-#include <Poly_Triangulation.hxx>
-#include <gp_Pnt.hxx>
-#include <BRepBuilderAPI_MakeFace.hxx>
-#include <BRepBuilderAPI_Sewing.hxx>
-#include <BRepBuilderAPI_MakePolygon.hxx>
-#include <BRepBuilderAPI_MakeFace.hxx>
-#include <BRep_Builder.hxx>
-#include <TopoDS_Compound.hxx>
-#include <BRepTools.hxx>
-#include <BRep_Builder.hxx>
-#include <TopoDS_Compound.hxx>
-#include <BRepBuilderAPI_MakeVertex.hxx>
-#include <BRepBuilderAPI_MakeSolid.hxx>
-#include <BRepLib.hxx>
-// 定义 CGAL 内核
-typedef CGAL::Exact_predicates_inexact_constructions_kernel K;
-typedef K::Point_3 Point_3;
-typedef CGAL::Polyhedron_3<K> Polyhedron;
-
-#if 0
 int main() {
-    std::string savePath = "E:\\soft\\code\\cMake_test\\output\\"; 
-    try {
-        // 1. [OCC] 读取 STEP 模型
-        std::string fileName = "E:\\soft\\code\\Project1\\input\\01.stp"; // 替换为你的文件名
-        STEPControl_Reader reader;
-        if (reader.ReadFile(fileName.c_str()) != IFSelect_RetDone) {
-            std::cerr << "Error: Cannot read STEP file." << std::endl;
-            // 演示目的：如果文件不存在，我们手动创建一个方块点云继续演示
-        }
-        reader.TransferRoots();
-        TopoDS_Shape shape = reader.OneShape();
+    inputPath = "E:\\soft\\code\\cMake_test\\input\\";
+    savePath = "E:\\soft\\code\\cMake_test\\output\\";
+    std::string stepfile = "4_stp_stp.stp";
 
-        // 2. [OCC] 将模型离散化 (Mesh)
-        // 参数 0.1 是挠度值，越小网格越密
-        BRepMesh_IncrementalMesh mesher(shape, 0.0001);
-        BRepTools::Write(shape, (savePath + "1_Mesh_Model.brep").c_str());
-
-        // 3. [OCC -> CGAL] 提取 Mesh 顶点并转换为 CGAL 点
-        std::vector<Point_3> cgal_points;
-        TopExp_Explorer faceExp(shape, TopAbs_FACE);
-        BRep_Builder B;
-        TopoDS_Compound pointCloudCompound;
-        B.MakeCompound(pointCloudCompound);
-        for (; faceExp.More(); faceExp.Next()) {
-            TopoDS_Face face = TopoDS::Face(faceExp.Current());
-            TopLoc_Location loc;
-            Handle(Poly_Triangulation) triangulation = BRep_Tool::Triangulation(face, loc);
-
-            if (!triangulation.IsNull()) {
-                for (int i = 1; i <= triangulation->NbNodes(); i++) {
-                    gp_Pnt p = triangulation->Node(i).Transformed(loc.Transformation());
-                    cgal_points.emplace_back(p.X(), p.Y(), p.Z());
-                    B.Add(pointCloudCompound, BRepBuilderAPI_MakeVertex(p).Vertex());
-                }
-            }
-        }
-        BRepTools::Write(pointCloudCompound, (savePath + "2_Point_Cloud.brep").c_str());
-        std::cout << "Extracted " << cgal_points.size() << " points from OCC Mesh." << std::endl;
-
-
-        // 在 cgal_points 提取循环结束后，强制加入 8 个标准角点
-        cgal_points.clear(); // 先清空提取到的点
-        cgal_points.emplace_back(0, 0, 0);
-        cgal_points.emplace_back(10, 0, 0);
-        cgal_points.emplace_back(0, 10, 0);
-        cgal_points.emplace_back(10, 10, 0);
-        cgal_points.emplace_back(0, 0, 10);
-        cgal_points.emplace_back(10, 0, 10);
-        cgal_points.emplace_back(0, 10, 10);
-        cgal_points.emplace_back(10, 10, 10);
-
-        std::cout << "DEBUG: Manually injected 8 corners of a cube." << std::endl;
-        // 后面继续跑 hull 计算和导出
-        // 4. [CGAL] 计算三维凸包
-        Polyhedron hull;
-        CGAL::convex_hull_3(cgal_points.begin(), cgal_points.end(), hull);
-        std::cout << "CGAL Convex Hull computed. Vertices: " << hull.size_of_vertices() << std::endl;
-        TopoDS_Compound hullFacesCompound;
-        B.MakeCompound(hullFacesCompound);
-
-        for (auto f = hull.facets_begin(); f != hull.facets_end(); ++f) {
-            auto h = f->facet_begin();
-            gp_Pnt p1(h->vertex()->point().x(), h->vertex()->point().y(), h->vertex()->point().z());
-            gp_Pnt p2((++h)->vertex()->point().x(), (++h)->vertex()->point().y(), (++h)->vertex()->point().z());
-            gp_Pnt p3((++h)->vertex()->point().x(), (++h)->vertex()->point().y(), (++h)->vertex()->point().z());
-
-            // 关键：Polygon (线) -> Wire (封闭线) -> Face (面)
-            BRepBuilderAPI_MakePolygon poly(p1, p2, p3, Standard_True);
-            if (poly.IsDone()) {
-                BRepBuilderAPI_MakeFace mf(poly.Wire());
-                if (mf.IsDone()) {
-                    B.Add(hullFacesCompound, mf.Face()); // 存入散面集合
-                }
-            }
-        }
-        BRepTools::Write(hullFacesCompound, (savePath + "3_Hull_Faces.brep").c_str());
-        // 5. [CGAL -> OCC] 重建凸包实体 (以最简单的三角形面为例)
-        BRepBuilderAPI_Sewing sewer(1e-6);
-        sewer.Add(hullFacesCompound); // 直接把刚才的散面集合丢进去
-        sewer.Perform();
-        TopoDS_Shape sewedShape = sewer.SewedShape();
-        BRepTools::Write(sewedShape, (savePath + "4_Sewed_Shell.brep").c_str());
-
-        // 5. 实体化 (Solid)
-        if (sewedShape.ShapeType() == TopAbs_SHELL) {
-            BRepBuilderAPI_MakeSolid ms(TopoDS::Shell(sewedShape));
-            if (ms.IsDone()) {
-                BRepTools::Write(ms.Solid(), (savePath + "5_Final_Solid.brep").c_str());
-            }
+    STEPControl_Reader reader;
+    std::string inputFileName = inputPath + stepfile;
+    if (reader.ReadFile(inputFileName.c_str()) != IFSelect_RetDone) {
+        cout << "无法读取 STEP 文件！" << endl;
+        return 1;
+    }
+    reader.TransferRoots();
+    TopoDS_Shape mainShape = reader.OneShape();
+    
+    cout << "模型已加载，开始自适应获取切分点..." << endl;
+    
+    // 为模型中的每个面分配一个唯一的 ID
+    TopTools_DataMapOfShapeInteger faceToIdMap;
+    int currentFaceId = 1;
+    TopExp_Explorer expFace(mainShape, TopAbs_FACE);
+    for (; expFace.More(); expFace.Next()) {
+        if (!faceToIdMap.IsBound(expFace.Current())) {
+            faceToIdMap.Bind(expFace.Current(), currentFaceId++);
         }
     }
-    catch (const std::exception& e) {
-        std::cerr << "Exception: " << e.what() << std::endl;
+    cout << "已为 " << currentFaceId - 1 << " 个面分配了 ID。" << endl;
+
+    std::map<int, double> filletMap = BuildFilletRadiusMap(mainShape, faceToIdMap);
+    cout << "已建立圆角半径映射，共 " << filletMap.size() << " 个面。" << endl;
+
+    OpenCavityFilterParams openCavityParams;
+
+    std::vector<double> splitPoints = GetSplitPointsAlongZ(mainShape);
+    
+    cout << "检测到 " << splitPoints.size() << " 个切分点:" << endl;
+    for (int i = 0; i < splitPoints.size(); i++) {
+        cout << "  [" << i << "] Z = " << splitPoints[i] << endl;
     }
-	system("pause"); // Windows 下暂停，方便查看输出
+
+    cout << "\n开始逐层切分模型 (从上往下)..." << endl;
+    
+    
+    // 分离存储：封闭型腔和开放型腔的数据使用独立容器，避免混合污染
+    std::vector<std::vector<Face2D>> allClosedLayerFaces;  // 封闭型腔专用
+    std::vector<std::vector<Face2D>> allOpenLayerFaces;    // 开放型腔专用
+
+    for (int i = (int)splitPoints.size() - 1; i >= 0; i--) {
+        double splitZ = splitPoints[i];
+        int reversedIndex = splitPoints.size() - 1 - i;
+        cout << "\n切分 (倒序 #" << reversedIndex << "/" << splitPoints.size() << ") (Z = " << splitZ << ")" << endl;
+        
+        if ( 2 )
+        {
+            // 提取本层的面（包含 SOLID + CAVITY）
+            std::vector<Face2D> currentLayerFaces = SliceModelAtZ(mainShape, splitZ, i, splitPoints.size()-1, faceToIdMap);
+
+            // 将封闭型腔相关的切片数据保存到专用容器
+            allClosedLayerFaces.push_back(currentLayerFaces);
+
+            // 1. 分离出实体面参与运算
+            std::vector<Face2D> currentSolidFaces;
+            std::vector<Face2D> currentConvexHullFaces;
+            for (const auto& f : currentLayerFaces) {
+                if (f.type == FaceType::SOLID) {
+                    currentSolidFaces.push_back(f);
+
+                    // 1. 转成Point_2 的格式，准备计算二维凸包
+                    vector<Point_2> points_2d = ConvertFaceToPoints2D_EK(f);
+
+                    // 2. 计算 2D 凸包
+                    std::vector<Point_2> hull_points;
+                    CGAL::convex_hull_2(points_2d.begin(), points_2d.end(), std::back_inserter(hull_points));
+
+                    // 3. 还原为 OneLine 闭合环并存入 outerLoop
+                    Face2D HullFace = ConvertPointsToHullFace_EK(hull_points, splitZ);
+                    currentConvexHullFaces.push_back(HullFace);
+                }
+            }
+
+            std::vector<Face2D> currentCavityFaces;
+            for (const auto& f : currentLayerFaces) {
+                if (f.type == FaceType::CAVITY) {
+                    currentCavityFaces.push_back(f);
+                }
+            }
+
+            std::vector<HullItem> hullItems;
+            for (size_t h = 0; h < currentConvexHullFaces.size() && h < currentSolidFaces.size(); ++h) {
+                HullItem item;
+                item.hull = currentConvexHullFaces[h];
+                item.solid = currentSolidFaces[h];
+                item.index = (int)h;
+                hullItems.push_back(item);
+            }
+
+            std::vector<HullGroup> mergedHullGroups = BuildMergedHullGroups(hullItems, openCavityParams);
+            std::vector<Face2D> currentMergedHullFaces;
+
+            cout << "  [开放型腔凸包合并] 原始凸包数量: " << currentConvexHullFaces.size()
+                << " -> 合并后大凸包数量: " << mergedHullGroups.size()
+                << " (阈值=" << openCavityParams.hullMergeDistance << "mm)" << endl;
+
+            std::vector<Face2D> pocketResults;
+
+            for (size_t groupIdx = 0; groupIdx < mergedHullGroups.size(); ++groupIdx) {
+                const HullGroup& group = mergedHullGroups[groupIdx];
+                Face2D mergedHullFace = ComputeMergedHullFace(hullItems, group.memberIndices, splitZ);
+                if (mergedHullFace.outerLoop.empty()) {
+                    continue;
+                }
+                currentMergedHullFaces.push_back(mergedHullFace);
+
+                cout << "    - 大凸包组[" << groupIdx << "] 成员数: " << group.memberIndices.size()
+                    << " 触发距离: " << group.triggerDistance << endl;
+
+                std::vector<Face2D> solidsInsideHull;
+                for (int memberIndex : group.memberIndices) {
+                    if (memberIndex >= 0 && memberIndex < (int)hullItems.size()) {
+                        solidsInsideHull.push_back(hullItems[memberIndex].solid);
+                    }
+                }
+
+                std::vector<Face2D> cavitiesInsideHull;
+                for (const auto& cavityFace : currentCavityFaces) {
+                    bool shouldSubtract = IsFaceInsideFace(cavityFace, mergedHullFace);
+                    if (!shouldSubtract) {
+                        std::vector<Face2D> intersection =
+                            BooleanFacesSingle(cavityFace, mergedHullFace, ClipType::Intersection, splitZ);
+                        shouldSubtract = !intersection.empty();
+                    }
+                    if (shouldSubtract) {
+                        cavitiesInsideHull.push_back(cavityFace);
+                    }
+                }
+
+                std::vector<Face2D> hullResult = { mergedHullFace };
+                for (const auto& solidFace : solidsInsideHull) {
+                    std::vector<Face2D> newResult;
+                    for (const auto& resultFace : hullResult) {
+                        std::vector<Face2D> diffResult = BooleanFacesSingle(resultFace, solidFace, ClipType::Difference, splitZ);
+                        newResult.insert(newResult.end(), diffResult.begin(), diffResult.end());
+                    }
+                    hullResult = newResult;
+                }
+
+                for (const auto& cavityFace : cavitiesInsideHull) {
+                    std::vector<Face2D> newResult;
+                    for (const auto& resultFace : hullResult) {
+                        std::vector<Face2D> diffResult = BooleanFacesSingle(resultFace, cavityFace, ClipType::Difference, splitZ);
+                        newResult.insert(newResult.end(), diffResult.begin(), diffResult.end());
+                    }
+                    hullResult = newResult;
+                }
+
+                pocketResults.insert(pocketResults.end(), hullResult.begin(), hullResult.end());
+            }
+            
+            std::vector<Face2D> tempOpenCavityFaces = RecoverOriginalFaceIdsByGeometry(pocketResults, currentSolidFaces);
+            for (auto& f : tempOpenCavityFaces) {
+                f.type = FaceType::OPENCAVITY;
+            }
+
+			//到处软边界线段，检查 ID 恢复和软边界标记是否正确（faceId == -1 的线段应该就是软边界）
+            std::string softEdgesName = savePath + "Slice_" + std::to_string(i) + "_ONLY_SoftEdges_Z" + std::to_string(splitZ) + ".brep";
+            ExportSoftEdgesToBrep(tempOpenCavityFaces, softEdgesName);
+
+            vector<Face2D> currentOpenCavityFaces = CleanAndFilterOpenCavities(tempOpenCavityFaces, filletMap, openCavityParams);
+
+            //debug 
+            for(auto& f : currentOpenCavityFaces) {
+				vector<Face2D> singleFaceVec = { f };
+				std::string singleFaceName = savePath + "Slice_" + "SingleOpenCavityFace_ID" + ".brep";
+				ExportFace2DToBrep(singleFaceVec, singleFaceName);
+                int cc = 0;
+            }
+
+            // 将开放型腔数据保存到专用容器
+            allOpenLayerFaces.push_back(currentOpenCavityFaces);
+
+
+
+			//DEBUG: 导出当前层的实体面和腔面，检查切分结果
+            std::string currentLayerFacesName = savePath + "Slice_" + std::to_string(i) + "currentLayerFaces.brep";
+            ExportFace2DToBrep(currentLayerFaces, currentLayerFacesName);
+            std::string currentSmallHullFaceName = savePath + "Slice_" + std::to_string(i) + "_IndependentSmallHulls_Z" + std::to_string(splitZ) + ".brep";
+            ExportFace2DToBrep(currentConvexHullFaces, currentSmallHullFaceName);
+            std::cout << "  [DEBUG] 本层独立小凸包已保存: " << currentSmallHullFaceName
+                << " 数量=" << currentConvexHullFaces.size() << std::endl;
+
+            std::string currentMergedHullFaceName = savePath + "Slice_" + std::to_string(i) + "_MergedBigHulls_Z" + std::to_string(splitZ) + ".brep";
+            ExportFace2DToBrep(currentMergedHullFaces, currentMergedHullFaceName);
+            std::cout << "  [DEBUG] 本层合并大凸包已保存: " << currentMergedHullFaceName
+                << " 数量=" << currentMergedHullFaces.size() << std::endl;
+            std::string currentSolidFaceName = savePath + "Slice_" + std::to_string(i) + "currentSolidFace.brep";
+            ExportFace2DToBrep(currentSolidFaces, currentSolidFaceName);
+            std::string currentCavityFaceName = savePath + "Slice_" + std::to_string(i) + "currentCavityFacee.brep";
+            ExportFace2DToBrep(currentCavityFaces, currentCavityFaceName);
+            std::string tempOpenCavityFaceName = savePath + "Slice_" + std::to_string(i) + "temp_OpenCavityFaces_Z" + std::to_string(splitZ) + ".brep";
+            ExportFace2DToBrep(tempOpenCavityFaces, tempOpenCavityFaceName);
+            std::string currentOpenCavityFaceName = savePath + "Slice_" + std::to_string(i) + "CGAL_OpenCavityFaces_Z" + std::to_string(splitZ) + ".brep";
+            ExportFace2DToBrep(currentOpenCavityFaces, currentOpenCavityFaceName);
+            int aaa = 0;
+        }
+
+    }
+    double modelMinZ = 0.0, modelMaxZ = 0.0;
+    GetShapeZRange(mainShape, modelMinZ, modelMaxZ);
+    bool isInteriorOpen = HasInteriorOpenCavity(allOpenLayerFaces, allClosedLayerFaces, modelMaxZ, splitPoints, 0.5);
+    std::vector<TopoDS_Compound> trueClosedCavities;
+    std::vector<CavityFeature> openCavityFeatures;
+    std::vector<CavityFeature> closedCavityFeatures;
+    std::vector<TopoDS_Compound> interiorNewClosedParts;
+    TopoDS_Compound interiorNewOpenCavity;
+    gp_Dir interiorOpenToolDir;
+
+    if (isInteriorOpen) {
+        // ================= 中部开放型腔独立旁路 =================
+        ProcessInteriorOpenCavityByBand(allClosedLayerFaces, allOpenLayerFaces, mainShape, splitPoints, faceToIdMap, savePath, interiorNewClosedParts, interiorNewOpenCavity, interiorOpenToolDir);
+    } else {
+        // ================= 提取封闭型腔特征面 =================
+        ProcessAndSplitClosedCavityFeatures(allClosedLayerFaces, mainShape, splitPoints, faceToIdMap, savePath, trueClosedCavities, closedCavityFeatures);
+
+        // ================= 提取开放型腔特征面 =================
+        openCavityFeatures = ProcessAndSplitOpenCavityFeatures(allOpenLayerFaces, allClosedLayerFaces, trueClosedCavities, mainShape, splitPoints, faceToIdMap, savePath);
+    }
+
+    cout << "\n";
+    cout << "======================================================================\n";
+    cout << "                      特征提取结果汇总\n";
+    cout << "======================================================================\n\n";
+
+    if (isInteriorOpen) {
+        cout << "【分支类型】中部开放型腔分支 (InteriorOpen)\n\n";
+
+        cout << "--- 重组封闭型腔 (Z轴分割后) ---\n";
+        cout << "  数量: " << interiorNewClosedParts.size() << " 个\n";
+        for (size_t i = 0; i < interiorNewClosedParts.size(); ++i) {
+            Bnd_Box box;
+            BRepBndLib::Add(interiorNewClosedParts[i], box);
+            double cxmin, cymin, czmin, cxmax, cymax, czmax;
+            box.Get(cxmin, cymin, czmin, cxmax, cymax, czmax);
+            cout << "  Part_" << i
+                << "  类型=OTHER"
+                << "  进刀方向=(0,0,-1)"
+                << "  Z范围=[" << czmax << "," << czmin << "]"
+                << "  深度=" << (czmax - czmin) << "mm\n";
+        }
+
+        cout << "\n--- 不可加工区域 (侧向加工) ---\n";
+        Bnd_Box openBox;
+        BRepBndLib::Add(interiorNewOpenCavity, openBox);
+        double oxmin, oymin, ozmin, oxmax, oymax, ozmax;
+        openBox.Get(oxmin, oymin, ozmin, oxmax, oymax, ozmax);
+        cout << "  类型=OTHER"
+            << "  进刀方向=(" << interiorOpenToolDir.X() << "," << interiorOpenToolDir.Y() << "," << interiorOpenToolDir.Z() << ")"
+            << "  Z范围=[" << ozmax << "," << ozmin << "]"
+            << "  深度=" << (ozmax - ozmin) << "mm\n";
+    } else {
+        cout << "【分支类型】正常分支\n\n";
+
+        cout << "--- 封闭型腔 (Z轴分割后) ---\n";
+        cout << "  数量: " << closedCavityFeatures.size() << " 个\n";
+        for (const auto& feat : closedCavityFeatures) {
+            cout << "  ID=" << feat.featureId
+                << "  类型=CLOSED  进刀方向=(0,0,-1)"
+                << "  Z范围=[" << feat.topZ << "," << feat.bottomZ << "]"
+                << "  深度=" << feat.totalDepth << "mm"
+                << "  切片层数=" << feat.stepLoops.size() << "\n";
+        }
+
+        cout << "\n--- 开放型腔 (加工可行性赛选后) ---\n";
+        cout << "  保留: " << openCavityFeatures.size() << " 个\n";
+        for (const auto& feat : openCavityFeatures) {
+            cout << "  ID=" << feat.featureId
+                << "  类型=" << (feat.type == CavityType::OPEN ? "OPEN" : feat.type == CavityType::CLOSED ? "CLOSED" : "OTHER")
+                << "  进刀方向=(" << feat.toolDirection.X() << "," << feat.toolDirection.Y() << "," << feat.toolDirection.Z() << ")"
+                << "  Z范围=[" << feat.topZ << "," << feat.bottomZ << "]"
+                << "  深度=" << feat.totalDepth << "mm";
+            if (feat.toolDirection.IsEqual(gp_Dir(0, 0, -1), 1e-6)) {
+                cout << "  Z轴分割=" << feat.stepLoops.size() << "层";
+            } else {
+                cout << "  跳过Z轴分割(侧向)";
+            }
+            cout << "\n";
+        }
+    }
+
+    cout << "\n======================================================================\n";
+    cout << "生成的 BREP 文件保存在 " << savePath << " 目录。\n";
+    cout << "======================================================================\n";
+
+    system("pause");
     return 0;
 }
-#endif
