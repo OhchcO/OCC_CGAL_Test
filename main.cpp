@@ -1,9 +1,30 @@
 ﻿#include "cavrity_mfr.h"
 
-int main() {
-    inputPath = "E:\\soft\\code\\cMake_test\\input\\";
-    savePath = "E:\\soft\\code\\cMake_test\\output\\";
-    std::string stepfile = "4_stp_stp.stp";
+int main(int argc, char* argv[]) {
+    // 命令行参数: CgalApp.exe <inputPath> <savePath> <stepfile>
+    // 若无参数则使用默认值，保持向后兼容
+    if (argc >= 4) {
+        inputPath = argv[1];
+        savePath  = argv[2];
+    } else {
+        inputPath = "E:\\soft\\code\\cMake_test\\input\\";
+        savePath  = "E:\\soft\\code\\cMake_test\\output\\";
+    }
+    // 确保路径以反斜杠结尾
+    if (!inputPath.empty() && inputPath.back() != '\\' && inputPath.back() != '/')
+        inputPath += "\\";
+    if (!savePath.empty() && savePath.back() != '\\' && savePath.back() != '/')
+        savePath += "\\";
+
+    std::string stepfile;
+    if (argc >= 4) {
+        stepfile = argv[3];
+    } else {
+        stepfile = "4_stp_stp.stp";
+    }
+
+    // 确保输出目录存在
+    _mkdir(savePath.c_str());
 
     STEPControl_Reader reader;
     std::string inputFileName = inputPath + stepfile;

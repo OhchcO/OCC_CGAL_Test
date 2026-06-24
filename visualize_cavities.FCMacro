@@ -1,0 +1,792 @@
+# ============================================================
+# FreeCAD 型腔识别与可视化宏
+# 完整流程：加载模型 → 选择输出路径 → 运行 CgalApp 识别 → 可视化结果
+# ============================================================
+
+import os
+import sys
+import glob
+import subprocess
+import FreeCAD
+import Import
+import Part
+import FreeCADGui
+
+try:
+    from PySide2 import QtWidgets, QtCore, QtGui
+except ImportError:
+    from PySide import QtWidgets, QtCore, QtGui
+
+
+# ============================================================
+# 数据结构
+# ============================================================
+
+class ColorGroup:
+    """一组带颜色的 BREP 文件集合"""
+    def __init__(self, name="Type_A", color=(0.9, 0.2, 0.2, 0.85)):
+        self.name = name
+        self.color = color
+        self.files = []
+
+
+# ============================================================
+# BREP 文件自动分类规则
+# ============================================================
+
+BREP_CATEGORIES = [
+    ("封闭型腔-未Z划分",     (0.90, 0.15, 0.15, 0.85), ["Final_True_ClosedCavity_"]),
+    ("封闭型腔-已Z划分",     (0.95, 0.45, 0.30, 0.85), ["Final_CAM_ClosedPart_"]),
+    ("开放型腔-未Z划分",     (0.10, 0.50, 0.90, 0.85), ["Final_True_OpenCavity_"]),
+    ("开放型腔-已Z划分",     (0.30, 0.70, 1.00, 0.85), ["Final_CAM_OpenPart_"]),
+    ("中部可加工区域",        (0.10, 0.85, 0.30, 0.85), ["InteriorOpen_NewClosedCavity"]),
+    ("中部不可加工区域",      (0.70, 0.20, 0.85, 0.85), ["InteriorOpen_NewOpenCavity"]),
+]
+
+
+def auto_classify_breps(output_dir):
+    """
+    扫描输出目录中的 BREP 文件，按命名规则自动分类。
+    返回 list of ColorGroup（已填充 files）。
+    """
+    all_breps = sorted(glob.glob(os.path.join(output_dir, "*.brep")))
+    if not all_breps:
+        return []
+
+    groups = []
+    used_files = set()
+
+    # 按预设规则分类
+    for cat_name, color, prefixes in BREP_CATEGORIES:
+        matched = []
+        for f in all_breps:
+            fname = os.path.basename(f)
+            for prefix in prefixes:
+                if prefix in fname:
+                    matched.append(f)
+                    used_files.add(f)
+                    break
+        if matched:
+            g = ColorGroup(name=cat_name, color=color)
+            g.files = matched
+            groups.append(g)
+
+    # 未分类文件归入"其他"
+    remaining = [f for f in all_breps if f not in used_files]
+    if remaining:
+        g = ColorGroup(name="其他文件", color=(0.95, 0.95, 0.95, 0.70))
+        g.files = remaining
+        groups.append(g)
+
+    return groups
+
+
+# ============================================================
+# 主配置对话框
+# ============================================================
+
+class MainWindow(QtWidgets.QDialog):
+    """
+    主界面：集成识别与可视化全流程
+    """
+
+    PRESET_COLORS = [
+        ("红色",   (0.90, 0.15, 0.15, 0.85)),
+        ("蓝色",   (0.10, 0.50, 0.90, 0.85)),
+        ("绿色",   (0.10, 0.85, 0.30, 0.85)),
+        ("橙色",   (0.95, 0.60, 0.10, 0.85)),
+        ("紫色",   (0.70, 0.20, 0.85, 0.85)),
+        ("黄色",   (0.95, 0.90, 0.10, 0.85)),
+        ("青色",   (0.10, 0.85, 0.85, 0.85)),
+        ("品红",   (0.85, 0.10, 0.70, 0.85)),
+        ("白色",   (0.95, 0.95, 0.95, 0.85)),
+        ("深灰",   (0.35, 0.35, 0.35, 0.70)),
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.step_path = ""
+        self.output_dir = ""
+        self.exe_path = ""
+        self.groups = []        # 识别结果分类后的 ColorGroup 列表
+        self.recognized = False
+
+        self.setWindowTitle("型腔识别与可视化")
+        self.setMinimumWidth(700)
+        self.setMinimumHeight(580)
+        self._build_ui()
+        self._auto_detect_exe()
+
+    # -------------------- UI 构建 --------------------
+
+    def _build_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # ===== 第1步：选择 STEP 模型 =====
+        step_group = QtWidgets.QGroupBox("第 1 步：选择输入模型 (STEP/STP)")
+        step_layout = QtWidgets.QHBoxLayout()
+        self.step_edit = QtWidgets.QLineEdit()
+        self.step_edit.setPlaceholderText("选择 STEP 文件...")
+        self.step_edit.textChanged.connect(self._on_input_changed)
+        step_btn = QtWidgets.QPushButton("浏览...")
+        step_btn.clicked.connect(self._browse_step)
+        step_layout.addWidget(self.step_edit)
+        step_layout.addWidget(step_btn)
+        step_group.setLayout(step_layout)
+        layout.addWidget(step_group)
+
+        # ===== 第2步：选择输出目录 =====
+        out_group = QtWidgets.QGroupBox("第 2 步：选择输出保存路径")
+        out_layout = QtWidgets.QHBoxLayout()
+        self.out_edit = QtWidgets.QLineEdit()
+        self.out_edit.setPlaceholderText("选择 BREP 输出目录...")
+        self.out_edit.textChanged.connect(self._on_input_changed)
+        out_btn = QtWidgets.QPushButton("浏览...")
+        out_btn.clicked.connect(self._browse_output)
+        out_layout.addWidget(self.out_edit)
+        out_layout.addWidget(out_btn)
+        out_group.setLayout(out_layout)
+        layout.addWidget(out_group)
+
+        # ===== 第3步：CgalApp 路径 =====
+        exe_group = QtWidgets.QGroupBox("第 3 步：识别程序 (CgalApp.exe)")
+        exe_layout = QtWidgets.QHBoxLayout()
+        self.exe_edit = QtWidgets.QLineEdit()
+        self.exe_edit.setPlaceholderText("自动检测或手动选择 CgalApp.exe ...")
+        exe_btn = QtWidgets.QPushButton("浏览...")
+        exe_btn.clicked.connect(self._browse_exe)
+        exe_layout.addWidget(self.exe_edit)
+        exe_layout.addWidget(exe_btn)
+        exe_group.setLayout(exe_layout)
+        layout.addWidget(exe_group)
+
+        # ===== 第4步：运行识别 =====
+        run_row = QtWidgets.QHBoxLayout()
+        self.btn_run = QtWidgets.QPushButton("开始识别")
+        self.btn_run.setMinimumHeight(40)
+        self.btn_run.setStyleSheet("font-weight: bold; font-size: 14px;")
+        self.btn_run.clicked.connect(self._run_recognition)
+        run_row.addWidget(self.btn_run)
+        layout.addLayout(run_row)
+
+        # ===== 状态输出 =====
+        self.log_text = QtWidgets.QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumHeight(120)
+        self.log_text.setStyleSheet("background-color: #1e1e1e; color: #cccccc; font-family: Consolas, monospace;")
+        layout.addWidget(self.log_text)
+
+        # ===== 第5步：识别结果分类预览 =====
+        result_group = QtWidgets.QGroupBox("第 5 步：识别结果 (自动分类，可手动调整)")
+        result_layout = QtWidgets.QVBoxLayout()
+
+        self.result_tree = QtWidgets.QTreeWidget()
+        self.result_tree.setHeaderLabels(["分组", "颜色", "文件数", "包含文件"])
+        self.result_tree.setColumnCount(4)
+        self.result_tree.setColumnWidth(0, 180)
+        self.result_tree.setColumnWidth(1, 60)
+        self.result_tree.setColumnWidth(2, 60)
+        self.result_tree.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        result_layout.addWidget(self.result_tree)
+
+        # 操作按钮行
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_refresh = QtWidgets.QPushButton("刷新分类")
+        btn_refresh.clicked.connect(self._refresh_classification)
+        btn_row.addWidget(btn_refresh)
+
+        btn_add_group = QtWidgets.QPushButton("添加分组")
+        btn_add_group.clicked.connect(self._add_custom_group)
+        btn_row.addWidget(btn_add_group)
+
+        btn_edit_color = QtWidgets.QPushButton("修改颜色")
+        btn_edit_color.clicked.connect(self._edit_group_color)
+        btn_row.addWidget(btn_edit_color)
+
+        btn_rm_group = QtWidgets.QPushButton("删除分组")
+        btn_rm_group.clicked.connect(self._remove_group)
+        btn_row.addWidget(btn_rm_group)
+
+        btn_add_files = QtWidgets.QPushButton("手动添加文件")
+        btn_add_files.clicked.connect(self._add_files_to_group)
+        btn_row.addWidget(btn_add_files)
+
+        result_layout.addLayout(btn_row)
+        result_group.setLayout(result_layout)
+        layout.addWidget(result_group)
+
+        # ===== 底部：可视化 & 取消 =====
+        bottom_row = QtWidgets.QHBoxLayout()
+        bottom_row.addStretch()
+
+        self.btn_visualize = QtWidgets.QPushButton("可视化渲染")
+        self.btn_visualize.setMinimumHeight(40)
+        self.btn_visualize.setMinimumWidth(160)
+        self.btn_visualize.setStyleSheet("font-weight: bold; font-size: 14px; background-color: #2a7; color: white;")
+        self.btn_visualize.clicked.connect(self._visualize)
+        self.btn_visualize.setEnabled(False)
+        bottom_row.addWidget(self.btn_visualize)
+
+        btn_close = QtWidgets.QPushButton("关闭")
+        btn_close.setMinimumHeight(40)
+        btn_close.clicked.connect(self.reject)
+        bottom_row.addWidget(btn_close)
+
+        layout.addLayout(bottom_row)
+
+    # -------------------- 自动检测 exe --------------------
+
+    def _auto_detect_exe(self):
+        """在常见路径中查找 CgalApp.exe"""
+        search_roots = [
+            os.path.dirname(os.path.abspath(__file__)),         # 宏所在目录
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "build"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "out"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "x64"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin"),
+        ]
+        # 向上一级目录也搜索
+        parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        search_roots.append(parent)
+        search_roots.append(os.path.join(parent, "build"))
+        search_roots.append(os.path.join(parent, "out"))
+
+        for root_dir in search_roots:
+            if not os.path.isdir(root_dir):
+                continue
+            for dirpath, dirnames, filenames in os.walk(root_dir):
+                if "CgalApp.exe" in filenames:
+                    self.exe_path = os.path.join(dirpath, "CgalApp.exe")
+                    self.exe_edit.setText(self.exe_path)
+                    self._log("[自动检测] 找到 CgalApp.exe: {}".format(self.exe_path))
+                    return
+                # 只搜索两层深度
+                depth = dirpath.replace(root_dir, "").count(os.sep)
+                if depth >= 2:
+                    dirnames.clear()
+
+        self._log("[提示] 未自动检测到 CgalApp.exe，请手动选择")
+
+    # -------------------- 浏览按钮 --------------------
+
+    def _browse_step(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "选择 STEP 模型文件", "",
+            "STEP 文件 (*.stp *.step *.STP *.STEP);;所有文件 (*)")
+        if path:
+            self.step_path = path
+            self.step_edit.setText(path)
+
+    def _browse_output(self):
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, "选择输出目录")
+        if path:
+            self.output_dir = path
+            self.out_edit.setText(path)
+
+    def _browse_exe(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "选择 CgalApp.exe", "",
+            "可执行文件 (*.exe);;所有文件 (*)")
+        if path:
+            self.exe_path = path
+            self.exe_edit.setText(path)
+
+    # -------------------- 输入变化时清空旧结果 --------------------
+
+    def _on_input_changed(self):
+        """切换模型或输出路径时，清空旧的识别结果"""
+        self.groups = []
+        self.result_tree.clear()
+        self.btn_visualize.setEnabled(False)
+        self.recognized = False
+
+    # -------------------- 日志 --------------------
+
+    def _log(self, msg):
+        self.log_text.append(msg)
+        self.log_text.verticalScrollBar().setValue(
+            self.log_text.verticalScrollBar().maximum())
+        print(msg)
+        QtWidgets.QApplication.processEvents()
+
+    # -------------------- 运行识别 --------------------
+
+    def _run_recognition(self):
+        # 校验输入
+        self.step_path = self.step_edit.text().strip()
+        self.output_dir = self.out_edit.text().strip()
+        self.exe_path = self.exe_edit.text().strip()
+
+        if not self.step_path or not os.path.isfile(self.step_path):
+            QtWidgets.QMessageBox.warning(self, "提示", "请先选择有效的 STEP 文件")
+            return
+        if not self.output_dir:
+            QtWidgets.QMessageBox.warning(self, "提示", "请先选择输出目录")
+            return
+        if not self.exe_path or not os.path.isfile(self.exe_path):
+            QtWidgets.QMessageBox.warning(self, "提示", "请先选择 CgalApp.exe")
+            return
+
+        # 确保输出目录存在，并清空旧的 BREP 文件
+        os.makedirs(self.output_dir, exist_ok=True)
+        old_files = glob.glob(os.path.join(self.output_dir, "*.brep"))
+        self._log("[清理] 发现 {} 个旧 BREP 文件，正在删除...".format(len(old_files)))
+        for old_file in old_files:
+            try:
+                os.remove(old_file)
+            except Exception:
+                pass
+        remaining = glob.glob(os.path.join(self.output_dir, "*.brep"))
+        if remaining:
+            self._log("[警告] 仍有 {} 个 BREP 文件未删除!".format(len(remaining)))
+
+        # 提取文件名和输入目录
+        step_file = os.path.basename(self.step_path)
+        input_dir = os.path.dirname(self.step_path)
+
+        self._log("")
+        self._log("=" * 50)
+        self._log("  开始运行型腔识别...")
+        self._log("  输入模型: {}".format(self.step_path))
+        self._log("  输出目录: {}".format(self.output_dir))
+        self._log("  程序: {}".format(self.exe_path))
+        self._log("=" * 50)
+
+        self.btn_run.setEnabled(False)
+        self.btn_run.setText("识别中...")
+        QtWidgets.QApplication.processEvents()
+
+        try:
+            # 构建完整 PATH，包含所有必要的 DLL 目录
+            import tempfile
+            exe_dir = os.path.dirname(os.path.abspath(self.exe_path))
+            dll_dirs = [
+                exe_dir,
+                r"C:\OpenCASCADE-7.7.0-vc14-64\opencascade-7.7.0\win64\vc14\bin",
+                r"C:\OpenCASCADE-7.7.0-vc14-64\tbb_2021.5-vc14-64\bin",
+                r"E:\soft\CGAL\CGAL-5.6.2\auxiliary\gmp\lib",
+                r"E:\soft\boost_1_74_0\lib",
+                r"C:\Windows\System32",
+            ]
+            # 去重，保留顺序
+            seen = set()
+            unique_dirs = []
+            for d in dll_dirs:
+                norm = os.path.normcase(os.path.normpath(d))
+                if norm not in seen and os.path.isdir(d):
+                    seen.add(norm)
+                    unique_dirs.append(d)
+
+            bat_path = os.path.join(tempfile.gettempdir(), "_cgal_run.bat")
+
+            # 路径统一转反斜杠，避免 cmd 混淆
+            exe_abs = os.path.abspath(self.exe_path).replace("/", "\\")
+            input_abs = os.path.abspath(input_dir).replace("/", "\\")
+            output_abs = os.path.abspath(self.output_dir).replace("/", "\\")
+
+            # 将所有 DLL 目录的 .dll 文件复制到 exe 目录，确保 Windows 能找到依赖
+            import shutil
+            copied = 0
+            for d in unique_dirs:
+                if d == exe_dir:
+                    continue
+                if not os.path.isdir(d):
+                    continue
+                for fname in os.listdir(d):
+                    if fname.lower().endswith(".dll"):
+                        src = os.path.join(d, fname)
+                        dst = os.path.join(exe_dir, fname)
+                        if not os.path.exists(dst):
+                            try:
+                                shutil.copy2(src, dst)
+                                copied += 1
+                            except Exception:
+                                pass
+            if copied > 0:
+                self._log("[调试] 已复制 {} 个 DLL 到 exe 目录".format(copied))
+
+            # 写入批处理文件
+            self._log("[调试] 实际参数: input_dir='{}', output='{}', file='{}'".format(input_abs, output_abs, step_file))
+            with open(bat_path, "w", encoding="utf-8") as f:
+                f.write("@echo off\n")
+                f.write('"{}" "{}" "{}" "{}"\n'.format(exe_abs, input_abs, output_abs, step_file))
+                f.write("set CGAL_EXIT=%ERRORLEVEL%\n")
+                f.write("echo CGAL_EXIT_CODE=%CGAL_EXIT%\n")
+                f.write("exit /b %CGAL_EXIT%\n")
+
+            # 用 cmd.exe 执行批处理
+            proc = subprocess.Popen(
+                ["cmd.exe", "/c", bat_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                cwd=exe_dir,
+                bufsize=1
+            )
+
+            actual_ret = None
+            for raw_line in iter(proc.stdout.readline, b''):
+                line = raw_line.decode("gbk", errors="replace").rstrip()
+                if line:
+                    # 从输出中解析实际的 exe 退出码
+                    if line.startswith("CGAL_EXIT_CODE="):
+                        try:
+                            actual_ret = int(line.split("=", 1)[1])
+                        except ValueError:
+                            pass
+                    self._log("  " + line)
+
+            proc.wait()
+            # 优先使用从输出解析的退出码，回退到 proc.returncode
+            ret = actual_ret if actual_ret is not None else proc.returncode
+
+            # 清理临时文件
+            try:
+                os.remove(bat_path)
+            except Exception:
+                pass
+
+            if ret == 0:
+                self._log("\n[完成] 识别成功，返回码=0")
+                # 列出输出目录中的 BREP 文件
+                result_files = glob.glob(os.path.join(self.output_dir, "*.brep"))
+                self._log("[调试] 输出目录共 {} 个 BREP 文件:".format(len(result_files)))
+                for rf in result_files[:10]:
+                    self._log("  - {}".format(os.path.basename(rf)))
+                if len(result_files) > 10:
+                    self._log("  ... 共 {} 个".format(len(result_files)))
+                self.recognized = True
+                self._refresh_classification()
+            else:
+                self._log("\n[错误] 识别程序返回码={}".format(ret))
+                if ret == -1073741511 or ret == 3221226665:
+                    self._log("[提示] 错误码 0xC0000217 = STATUS_DLL_NOT_FOUND")
+                    self._log("       程序缺少某个 DLL 依赖，请检查 PATH 或将所有 DLL 复制到 exe 目录")
+                elif ret == -1073741512 or ret == 3221226664:
+                    self._log("[提示] 错误码 0xC0000216 = STATUS_DLL_INIT_FAILED")
+
+        except Exception as e:
+            self._log("\n[异常] {}".format(str(e)))
+
+        finally:
+            self.btn_run.setEnabled(True)
+            self.btn_run.setText("开始识别")
+
+    # -------------------- 分类刷新 --------------------
+
+    def _refresh_classification(self):
+        self.output_dir = self.out_edit.text().strip()
+        if not self.output_dir or not os.path.isdir(self.output_dir):
+            QtWidgets.QMessageBox.warning(self, "提示", "输出目录无效，请先运行识别或手动指定输出路径")
+            return
+
+        self.groups = auto_classify_breps(self.output_dir)
+        self._populate_tree()
+
+        total = sum(len(g.files) for g in self.groups)
+        self._log("[分类] 共 {} 个 BREP 文件，分为 {} 组".format(total, len(self.groups)))
+
+        if self.groups:
+            self.btn_visualize.setEnabled(True)
+
+    def _populate_tree(self):
+        """将 self.groups 数据填入树形控件"""
+        self.result_tree.clear()
+        for gi, g in enumerate(self.groups):
+            item = QtWidgets.QTreeWidgetItem(self.result_tree)
+            item.setText(0, g.name)
+            item.setText(1, "  ")       # 颜色列用背景色表示
+            item.setText(2, str(len(g.files)))
+
+            r, g_val, b = [int(v * 255) for v in g.color[:3]]
+            item.setBackground(1, QtGui.QBrush(QtGui.QColor(r, g_val, b)))
+
+            # 子节点列出文件
+            for fpath in g.files:
+                child = QtWidgets.QTreeWidgetItem(item)
+                child.setText(0, os.path.basename(fpath))
+                child.setToolTip(0, fpath)
+                child.setCheckState(0, QtCore.Qt.Checked)
+
+            item.setExpanded(True)
+            # 存储索引以便后续修改
+            item.setData(0, QtCore.Qt.UserRole, gi)
+
+        self.result_tree.resizeColumnToContents(0)
+
+    # -------------------- 分组操作 --------------------
+
+    def _add_custom_group(self):
+        name, ok = QtWidgets.QInputDialog.getText(self, "添加分组", "分组名称:")
+        if ok and name:
+            color = self.PRESET_COLORS[len(self.groups) % len(self.PRESET_COLORS)][1]
+            self.groups.append(ColorGroup(name=name, color=color))
+            self._populate_tree()
+            if self.groups:
+                self.btn_visualize.setEnabled(True)
+
+    def _edit_group_color(self):
+        item = self.result_tree.currentItem()
+        if not item:
+            QtWidgets.QMessageBox.information(self, "提示", "请先在列表中选中一个分组")
+            return
+        gi = item.data(0, QtCore.Qt.UserRole)
+        if gi is None:
+            # 可能选中了子节点，取父节点
+            parent = item.parent()
+            if parent:
+                gi = parent.data(0, QtCore.Qt.UserRole)
+            else:
+                return
+        if gi is None or gi >= len(self.groups):
+            return
+
+        # 简单颜色选择对话
+        items = [name for name, _ in self.PRESET_COLORS]
+        choice, ok = QtWidgets.QInputDialog.getItem(
+            self, "选择颜色", "预设颜色:", items, 0, False)
+        if ok:
+            idx = items.index(choice)
+            self.groups[gi].color = self.PRESET_COLORS[idx][1]
+            self._populate_tree()
+
+    def _remove_group(self):
+        item = self.result_tree.currentItem()
+        if not item:
+            return
+        gi = item.data(0, QtCore.Qt.UserRole)
+        if gi is None:
+            parent = item.parent()
+            if parent:
+                gi = parent.data(0, QtCore.Qt.UserRole)
+        if gi is not None and gi < len(self.groups):
+            del self.groups[gi]
+            self._populate_tree()
+            if not self.groups:
+                self.btn_visualize.setEnabled(False)
+
+    def _add_files_to_group(self):
+        if not self.groups:
+            QtWidgets.QMessageBox.information(self, "提示", "请先添加一个分组")
+            return
+
+        # 选择目标分组
+        items = [g.name for g in self.groups]
+        choice, ok = QtWidgets.QInputDialog.getItem(
+            self, "选择分组", "添加到:", items, 0, False)
+        if not ok:
+            return
+        gi = items.index(choice)
+
+        files, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "选择 BREP 文件", self.output_dir,
+            "BREP 文件 (*.brep *.BREP);;所有文件 (*)")
+        if files:
+            self.groups[gi].files.extend(files)
+            self._populate_tree()
+            self._log("[手动添加] {} 个文件 -> {}".format(len(files), self.groups[gi].name))
+
+    # -------------------- 可视化渲染 --------------------
+
+    def _visualize(self):
+        if not self.groups:
+            QtWidgets.QMessageBox.warning(self, "提示", "没有可渲染的分组")
+            return
+
+        self.step_path = self.step_edit.text().strip()
+        if not self.step_path or not os.path.isfile(self.step_path):
+            QtWidgets.QMessageBox.warning(self, "提示", "请确认 STEP 文件路径有效")
+            return
+
+        self._log("\n" + "=" * 50)
+        self._log("  开始渲染可视化...")
+        self._log("  STEP: {}".format(self.step_path))
+        self._log("  分组数: {}".format(len(self.groups)))
+        for g in self.groups:
+            self._log("    [{}] {} 个文件".format(g.name, len(g.files)))
+            for f in g.files[:3]:
+                self._log("      - {}".format(os.path.basename(f)))
+            if len(g.files) > 3:
+                self._log("      ...")
+        self._log("=" * 50)
+
+        # 关闭已有的同名文档，避免残留旧结果
+        doc_name = "Cavity_Visualization"
+        for existing_doc in FreeCAD.listDocuments().values():
+            if existing_doc.Name.startswith(doc_name):
+                FreeCAD.closeDocument(existing_doc.Name)
+
+        doc = FreeCAD.newDocument(doc_name)
+
+        # 1. 导入原始模型（半透明，作为底色参考）
+        self._log("\n[1] 导入原始模型: {}".format(self.step_path))
+        Import.insert(self.step_path, doc.Name)
+        base_obj = doc.Objects[-1]
+        base_obj.Label = "00_Base_Model"
+        base_obj.ViewObject.DiffuseColor = (0.80, 0.80, 0.80, 1.0)
+        base_obj.ViewObject.Transparency = 50
+        self._log("    -> 半透明灰色，作为结构参考")
+
+        # 2. 逐组导入 BREP，同组内每个文件用不同色调
+        for gi, group in enumerate(self.groups):
+            base_color = group.color
+            label = group.name
+            imported = 0
+            valid_files = [f for f in group.files if os.path.exists(f)]
+            self._log("\n[{}] 导入组 '{}' (文件数: {})".format(gi + 2, label, len(valid_files)))
+
+            colors = _generate_variations(base_color, len(valid_files))
+
+            for fi, fpath in enumerate(valid_files):
+                Part.insert(fpath, doc.Name)
+                obj = doc.Objects[-1]
+                fname = os.path.splitext(os.path.basename(fpath))[0]
+                obj.Label = "{}_{}".format(label, fname)
+                obj.ViewObject.DiffuseColor = colors[fi]
+                obj.ViewObject.Transparency = 0
+
+                # Z-fighting 修复：型腔 BREP 微微偏移，避免与原模型面完全重合
+                try:
+                    offset = obj.Shape.makeOffsetShape(0.1, 0.01, False)
+                    if offset and not offset.isNull():
+                        obj.Shape = offset
+                except Exception:
+                    # 无法偏移时（面片/复合体），给 5% 透明度来缓解
+                    obj.ViewObject.Transparency = 5
+
+                imported += 1
+
+            self._log("    -> 导入 {} 个对象 (不透明彩色, 已偏移消除Z-fighting)".format(imported))
+
+        # 3. 调整视角
+        try:
+            FreeCADGui.ActiveDocument.ActiveView.viewIsometric()
+            FreeCADGui.ActiveDocument.ActiveView.fitAll()
+        except Exception:
+            pass
+
+        # 4. 打印图例
+        self._log("\n" + "-" * 50)
+        self._log("  图例:")
+        self._log("    半透明灰   = 原始零件本体 (50%透明)")
+        for group in self.groups:
+            r, g, b = [int(v * 255) for v in group.color[:3]]
+            self._log("    RGB({:>3},{:>3},{:>3}) = {} ({} 个文件, 不透明)".format(
+                r, g, b, group.name, len(group.files)))
+        self._log("-" * 50)
+        self._log("提示: 左侧模型树可切换每个对象的可见性")
+        self._log("      右键对象可切换实体/线框显示模式")
+        self._log("      按 F3 可显示/隐藏选中对象")
+        self._log("=" * 50)
+
+
+# ============================================================
+# 执行入口
+# ============================================================
+
+def _match_and_transparent_faces(base_obj, cavity_shapes, logger=None):
+    """
+    将原模型中与型腔 shape 重叠的面设为透明。
+    通过包围盒中心距离判断面是否匹配。
+    返回匹配的面数。
+    """
+    import Part as PartModule
+    from FreeCAD import Base
+
+    def _shape_center(s):
+        bb = s.BoundBox
+        return Base.Vector(bb.Center.x, bb.Center.y, bb.Center.z)
+
+    def _shape_diagonal(s):
+        bb = s.BoundBox
+        return (bb.XLength ** 2 + bb.YLength ** 2 + bb.ZLength ** 2) ** 0.5
+
+    # 收集所有型腔面的中心和尺寸
+    cavity_face_infos = []
+    for shape in cavity_shapes:
+        for face in shape.Faces:
+            center = _shape_center(face)
+            diag = _shape_diagonal(face)
+            cavity_face_infos.append((center, diag))
+
+    if not cavity_face_infos:
+        if logger:
+            logger._log("    [警告] 型腔中无面可匹配")
+        return 0
+
+    # 获取原模型的面列表
+    base_shape = base_obj.Shape
+    model_faces = base_shape.Faces
+    total_faces = len(model_faces)
+
+    if total_faces == 0:
+        return 0
+
+    # 构建逐面色数组：默认全部不透明
+    face_colors = [(0.75, 0.75, 0.75, 1.0)] * total_faces
+
+    matched = 0
+    tol = 1.0  # 容差 mm
+
+    for fi, model_face in enumerate(model_faces):
+        model_center = _shape_center(model_face)
+        model_diag = _shape_diagonal(model_face)
+
+        for cavity_center, cavity_diag in cavity_face_infos:
+            dist = model_center.distanceToPoint(cavity_center)
+            # 面中心距离 < 两个面对角线之和的一小部分 → 认为匹配
+            threshold = min(model_diag, cavity_diag) * 0.5 + tol
+            if dist < threshold:
+                face_colors[fi] = (0.75, 0.75, 0.75, 0.0)  # 完全透明
+                matched += 1
+                break
+
+    # 应用逐面色
+    base_obj.ViewObject.DiffuseColor = face_colors
+
+    if logger:
+        logger._log("    原模型共 {} 个面，匹配型腔 {} 个面".format(total_faces, matched))
+
+    return matched
+
+
+def _generate_variations(base_color, n):
+    """
+    基于一个 RGBA 颜色，生成 n 个视觉上可区分的颜色变体。
+    通过调整 HSV 的色相偏移来实现。
+    """
+    if n <= 0:
+        return []
+    if n == 1:
+        return [base_color]
+
+    import colorsys
+    r, g, b = base_color[0], base_color[1], base_color[2]
+    h, s, v = colorsys.rgb_to_hsv(r, g, b)
+
+    colors = []
+    for i in range(n):
+        # 色相偏移：在 ±30 度范围内均匀分布
+        hue_shift = (i / max(n - 1, 1)) * 0.15 - 0.075  # -0.075 ~ +0.075
+        new_h = (h + hue_shift) % 1.0
+        # 饱和度和亮度也做微小变化，增加区分度
+        s_factor = 0.85 + 0.3 * (i / max(n - 1, 1))
+        v_factor = 0.9 + 0.2 * ((n - 1 - i) / max(n - 1, 1))
+        new_s = min(s * s_factor, 1.0)
+        new_v = min(v * v_factor, 1.0)
+        nr, ng, nb = colorsys.hsv_to_rgb(new_h, new_s, new_v)
+        a = base_color[3] if len(base_color) > 3 else 0.85
+        colors.append((nr, ng, nb, a))
+
+    return colors
+
+
+def main():
+    global _dlg
+    _dlg = MainWindow()
+    _dlg.setWindowFlags(_dlg.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
+    _dlg.setModal(False)
+    _dlg.show()
+
+
+_dlg = None
+main()
