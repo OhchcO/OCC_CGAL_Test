@@ -25,8 +25,30 @@ include_directories("E:/soft/CGAL/CGAL-5.6.2/auxiliary/gmp/include")
 # 5. 添加可执行程序
 add_executable(CgalApp
 	main.cpp
-	cavrity_mfr.cpp
-	cavrity_mfr.h
+	cavity_common.h
+	cavity_globals.cpp
+	geom_utils.h
+	geom_utils.cpp
+	convex_hull.h
+	convex_hull.cpp
+	slicing.h
+	slicing.cpp
+	occ_utils.h
+	occ_utils.cpp
+	boolean_ops.h
+	boolean_ops.cpp
+	line_topology.h
+	line_topology.cpp
+	export_utils.h
+	export_utils.cpp
+	closed_cavity.h
+	closed_cavity.cpp
+	open_cavity.h
+	open_cavity.cpp
+	interior_open.h
+	interior_open.cpp
+	regression_test.h
+	regression_test.cpp
 	clipper.engine.cpp
 	clipper.offset.cpp
 	clipper.rectclip.cpp

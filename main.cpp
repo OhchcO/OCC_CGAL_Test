@@ -1,6 +1,21 @@
-﻿#include "cavrity_mfr.h"
+#include "cavity_common.h"
+#include "geom_utils.h"
+#include "convex_hull.h"
+#include "slicing.h"
+#include "occ_utils.h"
+#include "boolean_ops.h"
+#include "line_topology.h"
+#include "export_utils.h"
+#include "closed_cavity.h"
+#include "open_cavity.h"
+#include "interior_open.h"
+#include "regression_test.h"
 
 int main(int argc, char* argv[]) {
+    // 让 Windows 控制台正确显示中文（UTF-8）
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+
     // 命令行参数: CgalApp.exe <inputPath> <savePath> <stepfile>
     // 若无参数则使用默认值，保持向后兼容
     if (argc >= 4) {
@@ -311,6 +326,61 @@ int main(int argc, char* argv[]) {
     cout << "\n======================================================================\n";
     cout << "生成的 BREP 文件保存在 " << savePath << " 目录。\n";
     cout << "======================================================================\n";
+
+    // 记录本轮识别结果（保存到与 input/output 平级的 result_json 目录）
+    // 从 savePath（如 E:\...\output\）向上两级得到项目根目录，再拼 result_json
+    std::string resultJsonDir = savePath;
+    size_t pos1 = resultJsonDir.find_last_of("\\/");
+    if (pos1 != std::string::npos) resultJsonDir = resultJsonDir.substr(0, pos1);
+    size_t pos2 = resultJsonDir.find_last_of("\\/");
+    if (pos2 != std::string::npos) resultJsonDir = resultJsonDir.substr(0, pos2 + 1);
+    resultJsonDir += "result_json";
+    if (resultJsonDir.back() != '\\' && resultJsonDir.back() != '/') resultJsonDir += "\\";
+    _mkdir(resultJsonDir.c_str());
+
+    // 从模型文件名中提取不含扩展名的部分，作为 JSON 文件名
+    std::string modelBaseName = stepfile;
+    {
+        size_t dotPos = modelBaseName.find_last_of('.');
+        if (dotPos != std::string::npos) modelBaseName = modelBaseName.substr(0, dotPos);
+    }
+
+    // 合并封闭型腔和开放型腔，全部记录到 JSON 中
+    std::vector<CavityFeature> regressionFeatures;
+    regressionFeatures.insert(regressionFeatures.end(), closedCavityFeatures.begin(), closedCavityFeatures.end());
+    regressionFeatures.insert(regressionFeatures.end(), openCavityFeatures.begin(), openCavityFeatures.end());
+    std::vector<std::vector<Face2D>> regressionLayers;
+    regressionLayers.insert(regressionLayers.end(), allClosedLayerFaces.begin(), allClosedLayerFaces.end());
+    regressionLayers.insert(regressionLayers.end(), allOpenLayerFaces.begin(), allOpenLayerFaces.end());
+
+    const std::string regressionJson = resultJsonDir + modelBaseName + "_current.json";
+    SaveModelRegressionResult(regressionJson, stepfile, "run_001", regressionFeatures, regressionLayers);
+
+    // 如果存在同名 baseline 文件，则自动对比
+    const std::string baselineJson = resultJsonDir + modelBaseName + "_baseline.json";
+    {
+        std::ifstream baselineCheck(baselineJson);
+        if (baselineCheck.good()) {
+            RegressionDiffReport diffReport = CompareModelRegressionResults(baselineJson, regressionJson);
+            cout << "\n======================================================================\n";
+            cout << "                    回归测试对比报告\n";
+            cout << "======================================================================\n";
+            cout << "Baseline: " << baselineJson << "\n";
+            cout << "Current:  " << regressionJson << "\n";
+            cout << "Result:   ";
+            if (diffReport.overallResult == RegressionCompareResult::PASS) cout << "PASS\n";
+            else if (diffReport.overallResult == RegressionCompareResult::CHANGE) cout << "CHANGE\n";
+            else cout << "REGRESSION\n";
+            if (!diffReport.reasons.empty()) {
+                cout << "Reasons:\n";
+                for (const auto& r : diffReport.reasons) cout << "  - " << r << "\n";
+            }
+            cout << "======================================================================\n";
+        } else {
+            cout << "\n未找到 baseline 文件: " << baselineJson << "\n";
+            cout << "当前结果已保存为 baseline 候选，请人工确认后重命名为 baseline。\n";
+        }
+    }
 
     system("pause");
     return 0;

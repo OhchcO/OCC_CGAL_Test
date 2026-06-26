@@ -409,6 +409,7 @@ class MainWindow(QtWidgets.QDialog):
             self._log("[调试] 实际参数: input_dir='{}', output='{}', file='{}'".format(input_abs, output_abs, step_file))
             with open(bat_path, "w", encoding="utf-8") as f:
                 f.write("@echo off\n")
+                f.write("chcp 65001 >nul\n")
                 f.write('"{}" "{}" "{}" "{}"\n'.format(exe_abs, input_abs, output_abs, step_file))
                 f.write("set CGAL_EXIT=%ERRORLEVEL%\n")
                 f.write("echo CGAL_EXIT_CODE=%CGAL_EXIT%\n")
@@ -425,7 +426,7 @@ class MainWindow(QtWidgets.QDialog):
 
             actual_ret = None
             for raw_line in iter(proc.stdout.readline, b''):
-                line = raw_line.decode("gbk", errors="replace").rstrip()
+                line = raw_line.decode("utf-8", errors="replace").rstrip()
                 if line:
                     # 从输出中解析实际的 exe 退出码
                     if line.startswith("CGAL_EXIT_CODE="):

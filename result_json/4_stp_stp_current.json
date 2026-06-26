@@ -1,0 +1,155 @@
+{
+  "model": "4_stp_stp.stp",
+  "runId": "run_001",
+  "features": [
+    {
+      "featureId": "0",
+      "type": "CLOSED",
+      "topZ": 25,
+      "bottomZ": 10,
+      "originalFaceIds": [2, 17, 18, 19],
+      "hasFaceSplit": true,
+      "splitOriginalFaces": [2, 17, 19],
+      "originalFaces": [
+        { "originalFaceId": 2, "isSplit": true, "partCount": 462 },
+        { "originalFaceId": 17, "isSplit": true, "partCount": 44 },
+        { "originalFaceId": 18, "isSplit": false, "partCount": 1 },
+        { "originalFaceId": 19, "isSplit": true, "partCount": 36 }
+      ],
+      "signature": "CLOSED|25|10|2-17-18-19"
+    },
+    {
+      "featureId": "1",
+      "type": "CLOSED",
+      "topZ": 25,
+      "bottomZ": 10,
+      "originalFaceIds": [14, 31, 32, 33],
+      "hasFaceSplit": true,
+      "splitOriginalFaces": [14, 31, 33],
+      "originalFaces": [
+        { "originalFaceId": 14, "isSplit": true, "partCount": 462 },
+        { "originalFaceId": 31, "isSplit": true, "partCount": 36 },
+        { "originalFaceId": 32, "isSplit": false, "partCount": 1 },
+        { "originalFaceId": 33, "isSplit": true, "partCount": 44 }
+      ],
+      "signature": "CLOSED|25|10|14-31-32-33"
+    },
+    {
+      "featureId": "0",
+      "type": "OPEN",
+      "topZ": 45,
+      "bottomZ": 24.9876,
+      "originalFaceIds": [20],
+      "hasFaceSplit": false,
+      "splitOriginalFaces": [],
+      "originalFaces": [
+        { "originalFaceId": 20, "isSplit": false, "partCount": 1 }
+      ],
+      "signature": "OPEN|45|24.9876|20"
+    },
+    {
+      "featureId": "1",
+      "type": "OPEN",
+      "topZ": 25,
+      "bottomZ": 3,
+      "originalFaceIds": [3, 16, 21, 22],
+      "hasFaceSplit": true,
+      "splitOriginalFaces": [3, 16, 21],
+      "originalFaces": [
+        { "originalFaceId": 3, "isSplit": true, "partCount": 804 },
+        { "originalFaceId": 16, "isSplit": true, "partCount": 116 },
+        { "originalFaceId": 21, "isSplit": true, "partCount": 132 },
+        { "originalFaceId": 22, "isSplit": false, "partCount": 1 }
+      ],
+      "signature": "OPEN|25|3|3-16-21-22"
+    },
+    {
+      "featureId": "2",
+      "type": "OPEN",
+      "topZ": 45,
+      "bottomZ": 28.9954,
+      "originalFaceIds": [26],
+      "hasFaceSplit": false,
+      "splitOriginalFaces": [],
+      "originalFaces": [
+        { "originalFaceId": 26, "isSplit": false, "partCount": 1 }
+      ],
+      "signature": "OPEN|45|28.9954|26"
+    },
+    {
+      "featureId": "3",
+      "type": "OPEN",
+      "topZ": 29,
+      "bottomZ": 9,
+      "originalFaceIds": [9, 10, 11, 12, 13, 27, 28, 29],
+      "hasFaceSplit": true,
+      "splitOriginalFaces": [9, 10, 11, 12, 13, 27, 29],
+      "originalFaces": [
+        { "originalFaceId": 9, "isSplit": true, "partCount": 185 },
+        { "originalFaceId": 10, "isSplit": true, "partCount": 152 },
+        { "originalFaceId": 11, "isSplit": true, "partCount": 185 },
+        { "originalFaceId": 12, "isSplit": true, "partCount": 152 },
+        { "originalFaceId": 13, "isSplit": true, "partCount": 185 },
+        { "originalFaceId": 27, "isSplit": true, "partCount": 268 },
+        { "originalFaceId": 28, "isSplit": false, "partCount": 1 },
+        { "originalFaceId": 29, "isSplit": true, "partCount": 268 }
+      ],
+      "signature": "OPEN|29|9|9-10-11-12-13-27-28-29"
+    },
+    {
+      "featureId": "4",
+      "type": "OPEN",
+      "topZ": 29,
+      "bottomZ": 12.9954,
+      "originalFaceIds": [4, 5, 6, 7, 8, 23, 24, 25],
+      "hasFaceSplit": true,
+      "splitOriginalFaces": [4, 5, 6, 7, 8, 23, 25],
+      "originalFaces": [
+        { "originalFaceId": 4, "isSplit": true, "partCount": 126 },
+        { "originalFaceId": 5, "isSplit": true, "partCount": 76 },
+        { "originalFaceId": 6, "isSplit": true, "partCount": 126 },
+        { "originalFaceId": 7, "isSplit": true, "partCount": 76 },
+        { "originalFaceId": 8, "isSplit": true, "partCount": 126 },
+        { "originalFaceId": 23, "isSplit": true, "partCount": 134 },
+        { "originalFaceId": 24, "isSplit": false, "partCount": 1 },
+        { "originalFaceId": 25, "isSplit": true, "partCount": 134 }
+      ],
+      "signature": "OPEN|29|12.9954|4-5-6-7-8-23-24-25"
+    },
+    {
+      "featureId": "5",
+      "type": "OPEN",
+      "topZ": 45,
+      "bottomZ": 25,
+      "originalFaceIds": [34],
+      "hasFaceSplit": false,
+      "splitOriginalFaces": [],
+      "originalFaces": [
+        { "originalFaceId": 34, "isSplit": false, "partCount": 1 }
+      ],
+      "signature": "OPEN|45|25|34"
+    },
+    {
+      "featureId": "6",
+      "type": "OPEN",
+      "topZ": 25,
+      "bottomZ": 3,
+      "originalFaceIds": [15, 30, 35, 36],
+      "hasFaceSplit": true,
+      "splitOriginalFaces": [15, 30, 35],
+      "originalFaces": [
+        { "originalFaceId": 15, "isSplit": true, "partCount": 804 },
+        { "originalFaceId": 30, "isSplit": true, "partCount": 132 },
+        { "originalFaceId": 35, "isSplit": true, "partCount": 116 },
+        { "originalFaceId": 36, "isSplit": false, "partCount": 1 }
+      ],
+      "signature": "OPEN|25|3|15-30-35-36"
+    }
+  ],
+  "summary": {
+    "featureCount": 9,
+    "splitOriginalFaceCount": 26,
+    "sharedOriginalFaceCount": 0,
+    "featureSignature": "CLOSED|CLOSED|OPEN|OPEN|OPEN|OPEN|OPEN|OPEN|OPEN"
+  }
+}

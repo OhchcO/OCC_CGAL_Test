@@ -1,0 +1,122 @@
+{
+  "model": "1_stp_stp.stp",
+  "runId": "run_001",
+  "features": [
+    {
+      "featureId": "0",
+      "type": "CLOSED",
+      "topZ": 7.7,
+      "bottomZ": 6.2,
+      "originalFaceIds": [23],
+      "hasFaceSplit": false,
+      "splitOriginalFaces": [],
+      "originalFaces": [
+        { "originalFaceId": 23, "isSplit": false, "partCount": 1 }
+      ],
+      "signature": "CLOSED|7.7|6.2|23"
+    },
+    {
+      "featureId": "1",
+      "type": "CLOSED",
+      "topZ": 6.2,
+      "bottomZ": -1e-07,
+      "originalFaceIds": [25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90],
+      "hasFaceSplit": true,
+      "splitOriginalFaces": [25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90],
+      "originalFaces": [
+        { "originalFaceId": 25, "isSplit": true, "partCount": 285 },
+        { "originalFaceId": 26, "isSplit": true, "partCount": 21 },
+        { "originalFaceId": 27, "isSplit": true, "partCount": 21 },
+        { "originalFaceId": 28, "isSplit": true, "partCount": 147 },
+        { "originalFaceId": 29, "isSplit": true, "partCount": 21 },
+        { "originalFaceId": 30, "isSplit": true, "partCount": 30 },
+        { "originalFaceId": 31, "isSplit": true, "partCount": 21 },
+        { "originalFaceId": 32, "isSplit": true, "partCount": 147 },
+        { "originalFaceId": 33, "isSplit": true, "partCount": 21 },
+        { "originalFaceId": 34, "isSplit": true, "partCount": 21 },
+        { "originalFaceId": 35, "isSplit": true, "partCount": 285 },
+        { "originalFaceId": 36, "isSplit": true, "partCount": 21 },
+        { "originalFaceId": 37, "isSplit": true, "partCount": 21 },
+        { "originalFaceId": 38, "isSplit": true, "partCount": 147 },
+        { "originalFaceId": 39, "isSplit": true, "partCount": 21 },
+        { "originalFaceId": 40, "isSplit": true, "partCount": 30 },
+        { "originalFaceId": 41, "isSplit": true, "partCount": 21 },
+        { "originalFaceId": 42, "isSplit": true, "partCount": 147 },
+        { "originalFaceId": 43, "isSplit": true, "partCount": 21 },
+        { "originalFaceId": 44, "isSplit": true, "partCount": 21 },
+        { "originalFaceId": 79, "isSplit": true, "partCount": 6 },
+        { "originalFaceId": 80, "isSplit": true, "partCount": 3 },
+        { "originalFaceId": 81, "isSplit": true, "partCount": 3 },
+        { "originalFaceId": 82, "isSplit": true, "partCount": 3 },
+        { "originalFaceId": 83, "isSplit": true, "partCount": 3 },
+        { "originalFaceId": 84, "isSplit": true, "partCount": 6 },
+        { "originalFaceId": 85, "isSplit": true, "partCount": 6 },
+        { "originalFaceId": 86, "isSplit": true, "partCount": 3 },
+        { "originalFaceId": 87, "isSplit": true, "partCount": 3 },
+        { "originalFaceId": 88, "isSplit": true, "partCount": 3 },
+        { "originalFaceId": 89, "isSplit": true, "partCount": 3 },
+        { "originalFaceId": 90, "isSplit": true, "partCount": 6 }
+      ],
+      "signature": "CLOSED|6.2|-1e-07|25-26-27-28-29-30-31-32-33-34-35-36-37-38-39-40-41-42-43-44-79-80-81-82-83-84-85-86-87-88-89-90"
+    },
+    {
+      "featureId": "0",
+      "type": "OPEN",
+      "topZ": 4,
+      "bottomZ": 0,
+      "originalFaceIds": [1, 13, 14, 15, 16, 20, 21],
+      "hasFaceSplit": true,
+      "splitOriginalFaces": [1, 13, 14, 15, 16],
+      "originalFaces": [
+        { "originalFaceId": 1, "isSplit": true, "partCount": 16 },
+        { "originalFaceId": 13, "isSplit": true, "partCount": 16 },
+        { "originalFaceId": 14, "isSplit": true, "partCount": 20 },
+        { "originalFaceId": 15, "isSplit": true, "partCount": 236 },
+        { "originalFaceId": 16, "isSplit": true, "partCount": 20 },
+        { "originalFaceId": 20, "isSplit": false, "partCount": 1 },
+        { "originalFaceId": 21, "isSplit": false, "partCount": 1 }
+      ],
+      "signature": "OPEN|4|0|1-13-14-15-16-20-21"
+    },
+    {
+      "featureId": "1",
+      "type": "OPEN",
+      "topZ": 4,
+      "bottomZ": 0,
+      "originalFaceIds": [5, 6, 7, 8, 9, 18, 19],
+      "hasFaceSplit": true,
+      "splitOriginalFaces": [5, 6, 7, 8, 9],
+      "originalFaces": [
+        { "originalFaceId": 5, "isSplit": true, "partCount": 16 },
+        { "originalFaceId": 6, "isSplit": true, "partCount": 20 },
+        { "originalFaceId": 7, "isSplit": true, "partCount": 236 },
+        { "originalFaceId": 8, "isSplit": true, "partCount": 20 },
+        { "originalFaceId": 9, "isSplit": true, "partCount": 16 },
+        { "originalFaceId": 18, "isSplit": false, "partCount": 1 },
+        { "originalFaceId": 19, "isSplit": false, "partCount": 1 }
+      ],
+      "signature": "OPEN|4|0|5-6-7-8-9-18-19"
+    },
+    {
+      "featureId": "2",
+      "type": "OPEN",
+      "topZ": 21,
+      "bottomZ": 7.7,
+      "originalFaceIds": [22, 46, 47],
+      "hasFaceSplit": true,
+      "splitOriginalFaces": [46, 47],
+      "originalFaces": [
+        { "originalFaceId": 22, "isSplit": false, "partCount": 1 },
+        { "originalFaceId": 46, "isSplit": true, "partCount": 8 },
+        { "originalFaceId": 47, "isSplit": true, "partCount": 8 }
+      ],
+      "signature": "OPEN|21|7.7|22-46-47"
+    }
+  ],
+  "summary": {
+    "featureCount": 5,
+    "splitOriginalFaceCount": 44,
+    "sharedOriginalFaceCount": 0,
+    "featureSignature": "CLOSED|CLOSED|OPEN|OPEN|OPEN"
+  }
+}
